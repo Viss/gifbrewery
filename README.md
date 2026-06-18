@@ -47,17 +47,13 @@ From the source tree root:
 ```bash
 cargo fmt
 cargo check
-cargo build
+cargo build --release
 ```
 
-If you dont want a fucking 80 meg binary, do:
-
-```cargo build --release```
-
-The debug binary is:
+The binary is:
 
 ```bash
-target/debug/gifbrewery-gtk
+target/release/gifbrewery-gtk
 ```
 
 ## Run
