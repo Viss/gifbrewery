@@ -1,0 +1,17 @@
+[package]
+name = "gifbrewery-gtk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+gio = "0.20"
+glib = "0.20"
+gdk-pixbuf = "0.20"
+gtk = { package = "gtk4", version = "0.9", features = ["v4_14"] }
+gstreamer = "0.23"
+gstreamer-pbutils = "0.23"
+gifbrewery-core = { path = "../gifbrewery-core" }
+pangocairo = "0.20"

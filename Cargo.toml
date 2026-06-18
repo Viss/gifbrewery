@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/gifbrewery-core",
+    "crates/gifbrewery-gtk",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/gifbrewery-linux"
+rust-version = "1.80"
+
