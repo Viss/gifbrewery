@@ -51,6 +51,7 @@ cargo build
 ```
 
 If you dont want a fucking 80 meg binary, do:
+
 ```cargo build --release```
 
 The debug binary is:
