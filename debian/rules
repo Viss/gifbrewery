@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_install:
+	install -Dm755 target/release/gifbrewery-gtk debian/gifbrewery-linux/usr/bin/gifbrewery
+

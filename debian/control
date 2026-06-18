@@ -1,0 +1,31 @@
+Source: gifbrewery-linux
+Section: graphics
+Priority: optional
+Maintainer: GIF Brewery Linux contributors <maintainers@example.invalid>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libgtk-4-dev,
+ libadwaita-1-dev,
+ libgstreamer1.0-dev
+Standards-Version: 4.7.0
+Homepage: https://example.invalid/gifbrewery-linux
+Rules-Requires-Root: no
+
+Package: gifbrewery-linux
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ ffmpeg,
+ gstreamer1.0-plugins-base,
+ gstreamer1.0-plugins-good,
+ gstreamer1.0-plugins-bad,
+ gstreamer1.0-libav,
+ pipewire,
+ xdg-desktop-portal
+Description: Native GNOME GIF editor
+ A native GTK 4/libadwaita GIF editor inspired by GIF Brewery 3.
+
