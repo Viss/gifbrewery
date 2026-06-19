@@ -1,4 +1,6 @@
-use gifbrewery_core::{Clip, CropRect, FrameStrategy, Overlay, Project, RgbaColor, TextOverlay};
+use gifbrewery_core::{
+    Clip, CropRect, FrameStrategy, Overlay, Project, RgbaColor, TextAlignment, TextOverlay,
+};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -32,54 +34,26 @@ where
     let duration = clip.range.duration_seconds().max(0.01);
     let fps = export_fps(project, duration);
 
-    let explicit_size =
-        project.settings.gif.output_width.is_some() || project.settings.gif.output_height.is_some();
-    let mut auto_scale = 1.0;
-
-    for attempt in 0..5 {
-        let geometry = RenderGeometry::from_project(project, clip, auto_scale);
-        progress(ExportProgress {
-            percent: Some(0),
-            message: format!("Export pass {}...", attempt + 1),
-        });
-        render_gif_once(project, output_path, clip, fps, geometry, &progress)?;
-        let size = fs::metadata(output_path)
-            .map_err(|err| format!("failed to inspect exported GIF size: {err}"))?
-            .len();
-        crate::diagnostics::log_line(format_args!(
-            "GIF export attempt {}: {} bytes at {}x{}",
-            attempt + 1,
-            size,
-            geometry.output_width,
-            geometry.output_height
-        ));
-
-        let Some(target_max_bytes) = project.settings.gif.target_max_bytes else {
-            progress(ExportProgress {
-                percent: Some(100),
-                message: "Finalizing GIF loop metadata...".to_string(),
-            });
-            return ensure_gif_loops_forever(output_path);
-        };
-        if size <= target_max_bytes || explicit_size {
-            progress(ExportProgress {
-                percent: Some(100),
-                message: "Finalizing GIF loop metadata...".to_string(),
-            });
-            return ensure_gif_loops_forever(output_path);
+    let geometry = RenderGeometry::from_project(project, clip, 1.0);
+    progress(ExportProgress {
+        percent: Some(0),
+        message: "Exporting maximum-quality GIF...".to_string(),
+    });
+    render_gif_once(project, output_path, clip, fps, geometry, &progress)?;
+    let size = fs::metadata(output_path)
+        .map_err(|err| format!("failed to inspect exported GIF size: {err}"))?
+        .len();
+    crate::diagnostics::log_line(format_args!(
+        "GIF export complete: {} bytes at {}x{} timing={} max_quality=true",
+        size,
+        geometry.output_width,
+        geometry.output_height,
+        if source_is_gif(project) {
+            "source".to_string()
+        } else {
+            format!("{fps}fps")
         }
-
-        let shrink = ((target_max_bytes as f64 / size as f64).sqrt() * 0.96).clamp(0.25, 0.92);
-        auto_scale *= shrink;
-        if geometry.output_width <= 160 || geometry.output_height <= 90 {
-            progress(ExportProgress {
-                percent: Some(100),
-                message: "Finalizing GIF loop metadata...".to_string(),
-            });
-            return ensure_gif_loops_forever(output_path);
-        }
-    }
-
+    ));
     progress(ExportProgress {
         percent: Some(100),
         message: "Finalizing GIF loop metadata...".to_string(),
@@ -108,7 +82,7 @@ pub fn render_frame_png(
     frame_clip.range.end_seconds = frame_clip.range.start_seconds + (1.0 / f64::from(fps));
     let geometry = RenderGeometry::from_project(project, &frame_clip, 1.0);
     let text_dir = drawtext_temp_dir()?;
-    let video_filter = video_filter(project, &frame_clip, fps, geometry, &text_dir)?;
+    let video_filter = video_filter(project, &frame_clip, Some(fps), geometry, &text_dir)?;
 
     let result = run_ffmpeg_command(
         Command::new("ffmpeg")
@@ -156,7 +130,7 @@ pub fn render_frame_sequence(
     let fps = export_fps(project, duration);
     let geometry = RenderGeometry::from_project(project, clip, 1.0);
     let text_dir = drawtext_temp_dir()?;
-    let video_filter = video_filter(project, clip, fps, geometry, &text_dir)?;
+    let video_filter = video_filter(project, clip, Some(fps), geometry, &text_dir)?;
     fs::create_dir_all(output_dir).map_err(|err| {
         format!(
             "failed to create rendered frame sequence directory {}: {err}",
@@ -233,13 +207,14 @@ fn render_gif_once(
         .as_ref()
         .ok_or_else(|| "project has no source media".to_string())?;
     let text_dir = drawtext_temp_dir()?;
-    let video_filter = video_filter(project, clip, fps, geometry, &text_dir)?;
-    let palette_filter = format!(
-        "{video_filter},split[gifbrewery_palette_src][gifbrewery_frames];\
-         [gifbrewery_palette_src]palettegen=max_colors={}:stats_mode=full[gifbrewery_palette];\
-         [gifbrewery_frames][gifbrewery_palette]paletteuse=dither=sierra2_4a",
-        project.settings.gif.colors.clamp(256, 256)
-    );
+    let video_filter = video_filter(
+        project,
+        clip,
+        (!source_is_gif(project)).then_some(fps),
+        geometry,
+        &text_dir,
+    )?;
+    let palette_filter = palette_filter(project, &video_filter);
 
     let result = run_ffmpeg_command(
         Command::new("ffmpeg")
@@ -256,6 +231,8 @@ fn render_gif_once(
             .arg(&source.path)
             .arg("-filter_complex")
             .arg(palette_filter)
+            .arg("-global_palette")
+            .arg("0")
             .arg("-loop")
             .arg("0")
             .arg(output_path),
@@ -383,6 +360,15 @@ fn export_fps(project: &Project, duration: f64) -> u32 {
     }
 }
 
+fn source_is_gif(project: &Project) -> bool {
+    project
+        .source
+        .as_ref()
+        .and_then(|source| Path::new(&source.path).extension())
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RenderGeometry {
     source_height: u32,
@@ -480,7 +466,7 @@ fn normalized_crop(crop: Option<CropRect>) -> CropRect {
 fn video_filter(
     project: &Project,
     clip: &Clip,
-    fps: u32,
+    fps: Option<u32>,
     geometry: RenderGeometry,
     text_dir: &Path,
 ) -> Result<String, String> {
@@ -493,7 +479,10 @@ fn video_filter(
         geometry.output_height,
         geometry.text_scale()
     ));
-    let mut filters = vec![format!("fps={fps}")];
+    let mut filters = Vec::new();
+    if let Some(fps) = fps {
+        filters.push(format!("fps={fps}"));
+    }
     if let Some(crop) = clip.crop.map(|crop| normalized_crop(Some(crop))) {
         if crop.left > 0.0 || crop.right > 0.0 || crop.top > 0.0 || crop.bottom > 0.0 {
             filters.push(format!(
@@ -517,21 +506,44 @@ fn video_filter(
     for overlay in &project.overlays {
         match overlay {
             Overlay::Text(text) => {
-                let text_file = drawtext_file(text_dir, text)?;
-                filters.push(drawtext_filter(
-                    text,
-                    clip.range.start_seconds,
-                    geometry,
-                    &text_file,
-                ))
+                for (line_index, text_file) in drawtext_files(text_dir, text)? {
+                    filters.push(drawtext_filter(
+                        text,
+                        line_index,
+                        clip.range.start_seconds,
+                        geometry,
+                        &text_file,
+                    ));
+                }
             }
         }
+    }
+
+    if filters.is_empty() {
+        filters.push("null".to_string());
     }
 
     Ok(filters.join(","))
 }
 
-fn drawtext_file(text_dir: &Path, text: &TextOverlay) -> Result<PathBuf, String> {
+fn palette_filter(project: &Project, video_filter: &str) -> String {
+    let colors = project.settings.gif.colors.clamp(2, 256);
+    if project.settings.gif.high_quality_quantization {
+        format!(
+            "{video_filter},split[gifbrewery_palette_src][gifbrewery_frames];\
+             [gifbrewery_palette_src]palettegen=max_colors={colors}:reserve_transparent=0:stats_mode=single[gifbrewery_palette];\
+             [gifbrewery_frames][gifbrewery_palette]paletteuse=dither=none:new=1"
+        )
+    } else {
+        format!(
+            "{video_filter},split[gifbrewery_palette_src][gifbrewery_frames];\
+             [gifbrewery_palette_src]palettegen=max_colors={colors}:reserve_transparent=0:stats_mode=full[gifbrewery_palette];\
+             [gifbrewery_frames][gifbrewery_palette]paletteuse=dither=none"
+        )
+    }
+}
+
+fn drawtext_files(text_dir: &Path, text: &TextOverlay) -> Result<Vec<(usize, PathBuf)>, String> {
     let safe_id: String = text
         .id
         .chars()
@@ -543,26 +555,56 @@ fn drawtext_file(text_dir: &Path, text: &TextOverlay) -> Result<PathBuf, String>
             }
         })
         .collect();
-    let path = text_dir.join(format!("{safe_id}.txt"));
-    fs::write(&path, text.text.replace('\r', "")).map_err(|err| {
-        format!(
-            "failed to write drawtext temp file {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(path)
+
+    let normalized_text = text
+        .text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\u{0085}', "\n")
+        .replace('\u{2028}', "\n")
+        .replace('\u{2029}', "\n");
+    let mut files = Vec::new();
+
+    for (line_index, line) in normalized_text.split('\n').enumerate() {
+        let clean_line: String = line
+            .chars()
+            .filter(|ch| *ch == '\t' || !ch.is_control())
+            .collect();
+        if clean_line.is_empty() {
+            continue;
+        }
+
+        let path = text_dir.join(format!("{safe_id}-line-{line_index}.txt"));
+        fs::write(&path, clean_line).map_err(|err| {
+            format!(
+                "failed to write drawtext temp file {}: {err}",
+                path.display()
+            )
+        })?;
+        files.push((line_index, path));
+    }
+
+    Ok(files)
 }
 
 fn drawtext_filter(
     text: &TextOverlay,
+    line_index: usize,
     clip_start_seconds: f64,
     geometry: RenderGeometry,
     text_file: &Path,
 ) -> String {
     let escaped_text_file = escape_drawtext(&text_file.display().to_string());
     let font_argument = drawtext_font_argument(&text.font_family, text.font_weight);
-    let x = format!("w*{:.6}", text.bounds.x);
-    let y = format!("h*{:.6}", text.bounds.y);
+    let x = if text.alignment == TextAlignment::Center {
+        format!(
+            "w*{:.6}+(w*{:.6}-text_w)/2",
+            text.bounds.x, text.bounds.width
+        )
+    } else {
+        format!("w*{:.6}", text.bounds.x)
+    };
+    let y = format!("h*{:.6}+{}*line_h", text.bounds.y, line_index);
     let text_scale = geometry.text_scale();
     let font_size = (text.font_size * text_scale).max(1.0);
     let stroke_width = (text.stroke_width.max(0.0) * text_scale).round();
