@@ -112,6 +112,8 @@ pub struct TextOverlay {
     pub font_family: String,
     pub font_size: f64,
     pub font_weight: u32,
+    #[serde(default = "default_text_alignment")]
+    pub alignment: TextAlignment,
     pub text_color: RgbaColor,
     pub stroke_color: RgbaColor,
     pub stroke_width: f64,
@@ -138,6 +140,7 @@ impl TextOverlay {
             font_family: "Sans".to_string(),
             font_size: 32.0,
             font_weight: 700,
+            alignment: TextAlignment::Center,
             text_color: RgbaColor::WHITE,
             stroke_color: RgbaColor::BLACK,
             stroke_width: 1.0,
@@ -146,6 +149,16 @@ impl TextOverlay {
             blend_mode: BlendMode::Normal,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TextAlignment {
+    Left,
+    Center,
+}
+
+fn default_text_alignment() -> TextAlignment {
+    TextAlignment::Center
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -252,7 +265,7 @@ impl Default for GifExportSettings {
             colors: 256,
             optimize: false,
             high_quality_quantization: true,
-            target_max_bytes: Some(16 * 1024 * 1024),
+            target_max_bytes: None,
             output_width: None,
             output_height: None,
         }

@@ -3,12 +3,13 @@ use crate::thumbnails;
 use crate::timeline::{TimelineOverlayRange, TimelineView, TimelineViewState};
 use adw::prelude::*;
 use gifbrewery_core::{
-    CropRect, FrameStrategy, MediaSource, Overlay, Project, Rect, RgbaColor, TextOverlay,
-    TimelineRange,
+    CropRect, FrameStrategy, MediaSource, Overlay, Project, Rect, RgbaColor, TextAlignment,
+    TextOverlay, TimelineRange,
 };
 use gtk::{cairo, gdk, gio, pango};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -327,7 +328,8 @@ struct InspectorWidgets {
     overlay_mark_start: Option<gtk::Button>,
     overlay_mark_end: Option<gtk::Button>,
     overlay_font_size: Option<adw::SpinRow>,
-    overlay_bold: Option<adw::SwitchRow>,
+    overlay_bold: Option<gtk::ToggleButton>,
+    overlay_alignment: Option<gtk::ToggleButton>,
     overlay_stroke_width: Option<adw::SpinRow>,
     overlay_shadow: Option<adw::SwitchRow>,
 }
@@ -718,6 +720,7 @@ fn build_inspector(project: &Project) -> (gtk::Box, InspectorWidgets) {
             overlay_mark_end: overlay_widgets.mark_end,
             overlay_font_size: overlay_widgets.font_size,
             overlay_bold: overlay_widgets.bold,
+            overlay_alignment: overlay_widgets.alignment,
             overlay_stroke_width: overlay_widgets.stroke_width,
             overlay_shadow: overlay_widgets.shadow,
         },
@@ -805,21 +808,17 @@ fn build_gif_page(project: &Project) -> (gtk::ScrolledWindow, GifInspectorWidget
         99.0,
         1.0,
     );
-    group.add(&target_size_mb);
     let optimize = switch_row("Optimize GIF", settings.optimize);
-    group.add(&optimize);
     let high_quality_quantization = switch_row(
-        "High-quality quantization",
+        "Maximum quality palettes",
         settings.high_quality_quantization,
     );
     group.add(&high_quality_quantization);
     page.add(&group);
 
-    let size_group = adw::PreferencesGroup::builder()
-        .title("Output Size")
-        .build();
+    let size_group = adw::PreferencesGroup::builder().title("Resize").build();
     let output_width = spin_row(
-        "Width",
+        "Width (0 = source)",
         settings.output_width.map(f64::from).unwrap_or(0.0),
         0.0,
         4096.0,
@@ -827,7 +826,7 @@ fn build_gif_page(project: &Project) -> (gtk::ScrolledWindow, GifInspectorWidget
     );
     size_group.add(&output_width);
     let output_height = spin_row(
-        "Height",
+        "Height (0 = source)",
         settings.output_height.map(f64::from).unwrap_or(0.0),
         0.0,
         4096.0,
@@ -878,7 +877,8 @@ struct OverlayInspectorWidgets {
     mark_start: Option<gtk::Button>,
     mark_end: Option<gtk::Button>,
     font_size: Option<adw::SpinRow>,
-    bold: Option<adw::SwitchRow>,
+    bold: Option<gtk::ToggleButton>,
+    alignment: Option<gtk::ToggleButton>,
     stroke_width: Option<adw::SpinRow>,
     shadow: Option<adw::SwitchRow>,
 }
@@ -920,11 +920,55 @@ fn build_overlays_page(project: &Project) -> (gtk::ScrolledWindow, OverlayInspec
         .build();
     overlays_group.add(&action_row_with_suffix("Selected overlay", &delete_button));
 
+    let font_size_row = spin_row("Font size", placeholder.font_size, 6.0, 240.0, 1.0);
+    font_size_row.set_sensitive(has_overlay);
+    options_group.add(&font_size_row);
+
+    let stroke_width_row = spin_row("Stroke width", placeholder.stroke_width, 0.0, 20.0, 0.5);
+    stroke_width_row.set_sensitive(has_overlay);
+    options_group.add(&stroke_width_row);
+
+    let text_color_button = color_button("Text color", placeholder.text_color);
+    text_color_button.set_tooltip_text(Some("Text color"));
+    text_color_button.set_sensitive(has_overlay);
+    let stroke_color_button = color_button("Stroke color", placeholder.stroke_color);
+    stroke_color_button.set_tooltip_text(Some("Stroke color"));
+    stroke_color_button.set_sensitive(has_overlay);
+    let color_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    color_box.append(&labeled_compact_widget("Text", &text_color_button));
+    color_box.append(&labeled_compact_widget("Stroke", &stroke_color_button));
+    options_group.add(&action_row_with_suffix("Colors", &color_box));
+
+    let bold_button = gtk::ToggleButton::builder()
+        .label("B")
+        .tooltip_text("Toggle bold text")
+        .active(placeholder.font_weight >= 600)
+        .sensitive(has_overlay)
+        .build();
+    bold_button.add_css_class("flat");
+    let alignment_button = gtk::ToggleButton::builder()
+        .label("Center")
+        .tooltip_text("Toggle centered text")
+        .active(placeholder.alignment == TextAlignment::Center)
+        .sensitive(has_overlay)
+        .build();
+    alignment_button.add_css_class("flat");
+    let style_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    style_box.append(&bold_button);
+    style_box.append(&alignment_button);
+    options_group.add(&action_row_with_suffix("Style", &style_box));
+
     let text_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .margin_top(8)
-        .margin_bottom(8)
+        .spacing(4)
+        .margin_top(6)
+        .margin_bottom(6)
         .margin_start(12)
         .margin_end(12)
         .build();
@@ -940,13 +984,13 @@ fn build_overlays_page(project: &Project) -> (gtk::ScrolledWindow, OverlayInspec
         .bottom_margin(6)
         .left_margin(8)
         .right_margin(8)
-        .height_request(82)
+        .height_request(56)
         .sensitive(has_overlay)
         .build();
     text_view.buffer().set_text(&placeholder.text);
     let text_scroller = gtk::ScrolledWindow::builder()
-        .min_content_height(82)
-        .max_content_height(120)
+        .min_content_height(56)
+        .max_content_height(86)
         .child(&text_view)
         .build();
     text_scroller.add_css_class("card");
@@ -968,6 +1012,12 @@ fn build_overlays_page(project: &Project) -> (gtk::ScrolledWindow, OverlayInspec
         .sensitive(has_overlay)
         .build();
     font_row.add_suffix(&font_button);
+    let font_refresh_button = gtk::Button::builder()
+        .label("Refresh")
+        .tooltip_text("Refresh the system font list")
+        .sensitive(has_overlay)
+        .build();
+    font_row.add_suffix(&font_refresh_button);
     font_row.set_activatable_widget(Some(&font_button));
     font_row.set_sensitive(has_overlay);
     options_group.add(&font_row);
@@ -977,70 +1027,23 @@ fn build_overlays_page(project: &Project) -> (gtk::ScrolledWindow, OverlayInspec
         "font picker initialized: families={font_count} selected={}",
         placeholder.font_family
     ));
-
-    let font_refresh_button = gtk::Button::builder()
-        .label("Refresh")
-        .tooltip_text("Refresh the system font list")
-        .sensitive(has_overlay)
-        .build();
-    options_group.add(&action_row_with_suffix("Fonts", &font_refresh_button));
-    let text_color_button = color_button("Text color", placeholder.text_color);
-    text_color_button.set_sensitive(has_overlay);
-    options_group.add(&action_row_with_suffix("Text color", &text_color_button));
-    let stroke_color_button = color_button("Stroke color", placeholder.stroke_color);
-    stroke_color_button.set_sensitive(has_overlay);
-    options_group.add(&action_row_with_suffix(
-        "Stroke color",
-        &stroke_color_button,
-    ));
-    let appears_row = spin_row(
-        "Appears",
-        placeholder.range.start_seconds,
-        0.0,
-        3600.0,
-        0.01,
-    );
-    appears_row.set_sensitive(has_overlay);
-    options_group.add(&appears_row);
     let mark_appears_button = gtk::Button::builder()
-        .label("Set")
+        .label("Set start")
         .tooltip_text("Set appear time to the current playhead")
         .sensitive(has_overlay)
         .build();
-    options_group.add(&action_row_with_suffix(
-        "Appears at playhead",
-        &mark_appears_button,
-    ));
-    let disappear_row = spin_row(
-        "Disappears",
-        placeholder.range.end_seconds,
-        0.01,
-        3600.0,
-        0.01,
-    );
-    disappear_row.set_sensitive(has_overlay);
-    options_group.add(&disappear_row);
     let mark_disappears_button = gtk::Button::builder()
-        .label("Set")
+        .label("Set end")
         .tooltip_text("Set disappear time to the current playhead")
         .sensitive(has_overlay)
         .build();
-    options_group.add(&action_row_with_suffix(
-        "Disappears at playhead",
-        &mark_disappears_button,
-    ));
-    let font_size_row = spin_row("Font size", placeholder.font_size, 6.0, 240.0, 1.0);
-    font_size_row.set_sensitive(has_overlay);
-    options_group.add(&font_size_row);
-    let bold_row = switch_row("Bold", placeholder.font_weight >= 600);
-    bold_row.set_sensitive(has_overlay);
-    options_group.add(&bold_row);
-    let stroke_width_row = spin_row("Stroke width", placeholder.stroke_width, 0.0, 20.0, 0.5);
-    stroke_width_row.set_sensitive(has_overlay);
-    options_group.add(&stroke_width_row);
-    let shadow_row = switch_row("Shadow", placeholder.shadow_enabled);
-    shadow_row.set_sensitive(has_overlay);
-    options_group.add(&shadow_row);
+    let timing_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    timing_box.append(&mark_appears_button);
+    timing_box.append(&mark_disappears_button);
+    options_group.add(&action_row_with_suffix("Timing", &timing_box));
 
     page.add(&overlays_group);
     page.add(&options_group);
@@ -1056,14 +1059,15 @@ fn build_overlays_page(project: &Project) -> (gtk::ScrolledWindow, OverlayInspec
             list: Some(overlay_list),
             add: Some(add_button),
             delete: Some(delete_button),
-            start: Some(appears_row),
-            end: Some(disappear_row),
+            start: None,
+            end: None,
             mark_start: Some(mark_appears_button),
             mark_end: Some(mark_disappears_button),
             font_size: Some(font_size_row),
-            bold: Some(bold_row),
+            bold: Some(bold_button),
+            alignment: Some(alignment_button),
             stroke_width: Some(stroke_width_row),
-            shadow: Some(shadow_row),
+            shadow: None,
         },
     )
 }
@@ -1089,6 +1093,21 @@ fn action_row_with_suffix(title: &str, suffix: &impl IsA<gtk::Widget>) -> adw::A
     row.add_suffix(suffix);
     row.set_activatable_widget(Some(suffix));
     row
+}
+
+fn labeled_compact_widget(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let box_ = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+    let label = gtk::Label::builder()
+        .label(label)
+        .xalign(0.0)
+        .css_classes(["caption"])
+        .build();
+    box_.append(&label);
+    box_.append(widget);
+    box_
 }
 
 fn populate_overlay_list(list: &gtk::ListBox, labels: &[String], selected_index: usize) {
@@ -1311,10 +1330,6 @@ fn clip_fps_value(strategy: &FrameStrategy) -> f64 {
         FrameStrategy::DelayMillis(delay) if *delay > 0 => f64::from(1000 / delay),
         FrameStrategy::DelayMillis(_) => 12.0,
     }
-}
-
-fn megabytes_to_bytes(megabytes: f64) -> u64 {
-    (megabytes.max(1.0) * 1024.0 * 1024.0).round() as u64
 }
 
 fn scrolled_page(page: adw::PreferencesPage) -> gtk::ScrolledWindow {
@@ -1823,15 +1838,33 @@ fn install_widget_bindings(
         });
     }
 
-    if let Some(row) = &widgets.inspector.overlay_bold {
-        row.connect_notify_local(Some("active"), {
+    if let Some(button) = &widgets.inspector.overlay_bold {
+        button.connect_toggled({
             let state = Rc::clone(state);
             let widgets = widgets.clone();
-            move |row, _| {
+            move |button| {
                 if state.borrow().syncing_widgets {
                     return;
                 }
-                update_overlay_bold(&state, &widgets, row.is_active());
+                update_overlay_bold(&state, &widgets, button.is_active());
+            }
+        });
+    }
+
+    if let Some(button) = &widgets.inspector.overlay_alignment {
+        button.connect_toggled({
+            let state = Rc::clone(state);
+            let widgets = widgets.clone();
+            move |button| {
+                if state.borrow().syncing_widgets {
+                    return;
+                }
+                let alignment = if button.is_active() {
+                    TextAlignment::Center
+                } else {
+                    TextAlignment::Left
+                };
+                update_overlay_alignment(&state, &widgets, alignment);
             }
         });
     }
@@ -2487,7 +2520,7 @@ fn show_export_preview(window: &adw::ApplicationWindow, output_path: &Path) {
         .margin_end(12)
         .build();
     let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::Contain)
+        .content_fit(gtk::ContentFit::ScaleDown)
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -2611,6 +2644,10 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
 fn animate_picture_frames(picture: gtk::Picture, frames: Vec<PathBuf>, delay_ms: u64) {
     let frames = Rc::new(frames);
     let index = Rc::new(Cell::new(0usize));
+    picture.set_content_fit(gtk::ContentFit::ScaleDown);
+    if let Ok(texture) = gdk::Texture::from_file(&gio::File::for_path(&frames[0])) {
+        picture.set_size_request(texture.width(), texture.height());
+    }
     picture.set_file(Some(&gio::File::for_path(&frames[0])));
     glib::timeout_add_local(std::time::Duration::from_millis(delay_ms), move || {
         let next = (index.get() + 1) % frames.len();
@@ -2893,10 +2930,10 @@ fn update_clip_end(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, end_seco
     update_timeline_widgets(state, widgets);
 }
 
-fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, megabytes: f64) {
+fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, _megabytes: f64) {
     {
         let mut state = state.borrow_mut();
-        state.project.settings.gif.target_max_bytes = Some(megabytes_to_bytes(megabytes));
+        state.project.settings.gif.target_max_bytes = None;
     }
     update_timeline_widgets(state, widgets);
 }
@@ -3101,6 +3138,93 @@ fn overlay_visible_at_playhead(text: &TextOverlay, playhead_seconds: f64) -> boo
         && playhead_seconds <= text.range.end_seconds + 0.0005
 }
 
+fn next_text_overlay_defaults(project: &Project, selected_id: Option<&str>) -> TextOverlay {
+    if let Some(selected_id) = selected_id {
+        if let Some(text) = project.overlays.iter().find_map(|overlay| match overlay {
+            Overlay::Text(text) if text.id == selected_id => Some(text.clone()),
+            _ => None,
+        }) {
+            return text;
+        }
+    }
+
+    if let Some(text) = project
+        .overlays
+        .iter()
+        .rev()
+        .find_map(|overlay| match overlay {
+            Overlay::Text(text) => Some(text.clone()),
+        })
+    {
+        return text;
+    }
+
+    let mut text = TextOverlay::default_caption();
+    if let Some(font_family) = load_last_font_family() {
+        text.font_family = font_family;
+    }
+    text
+}
+
+fn initial_overlay_font_size(project: &Project, requested_size: f64) -> f64 {
+    let reference_height = preview_text_reference_height(project)
+        .or_else(|| {
+            project
+                .source
+                .as_ref()
+                .and_then(|source| source.natural_height)
+        })
+        .unwrap_or(540);
+    let fit_size = (f64::from(reference_height) * 0.13).clamp(12.0, 42.0);
+    requested_size.clamp(6.0, fit_size)
+}
+
+fn last_font_family_path() -> Option<PathBuf> {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(config_home);
+        if !path.as_os_str().is_empty() {
+            return Some(path.join("gifbrewery-gtk").join("last-font-family"));
+        }
+    }
+
+    std::env::var("HOME").ok().and_then(|home| {
+        let path = PathBuf::from(home);
+        (!path.as_os_str().is_empty()).then(|| {
+            path.join(".config")
+                .join("gifbrewery-gtk")
+                .join("last-font-family")
+        })
+    })
+}
+
+fn load_last_font_family() -> Option<String> {
+    let path = last_font_family_path()?;
+    let family = fs::read_to_string(path).ok()?;
+    let family = family.trim();
+    (!family.is_empty()).then(|| family.to_string())
+}
+
+fn save_last_font_family(family: &str) {
+    let Some(path) = last_font_family_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            crate::diagnostics::log_line(format_args!(
+                "failed to create font preference directory {}: {err}",
+                parent.display()
+            ));
+            return;
+        }
+    }
+    if let Err(err) = fs::write(&path, family.trim()) {
+        crate::diagnostics::log_line(format_args!(
+            "failed to save last font family {}: {err}",
+            path.display()
+        ));
+    }
+}
+
 fn overlay_labels(project: &Project) -> Vec<String> {
     project
         .overlays
@@ -3169,11 +3293,15 @@ fn add_text_overlay_at_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidg
             clip_range.start_seconds,
             (clip_range.end_seconds - 0.01).max(0.0),
         );
-        let mut text = TextOverlay::default_caption();
+        let mut text =
+            next_text_overlay_defaults(&state.project, state.selected_overlay_id.as_deref());
         text.id = id.clone();
         text.text = format!("Text {}", state.project.overlays.len() + 1);
+        text.font_size = initial_overlay_font_size(&state.project, text.font_size);
+        text.shadow_enabled = false;
         let overlay_offset = (state.project.overlays.len() % 4) as f64;
-        text.bounds.x = (0.1 + overlay_offset * 0.04).min(0.72);
+        text.bounds.width = 0.92;
+        text.bounds.x = (0.04 + overlay_offset * 0.025).min(0.96 - text.bounds.width);
         text.bounds.y = (0.72 - overlay_offset * 0.08).max(0.12);
         text.range = TimelineRange {
             start_seconds,
@@ -3222,6 +3350,7 @@ fn update_overlay_font_family(state: &Rc<RefCell<AppState>>, widgets: &AppWidget
             let family = family.trim();
             if !family.is_empty() {
                 overlay.font_family = family.to_string();
+                save_last_font_family(family);
                 crate::diagnostics::log_line(format_args!(
                     "updated text overlay font family: id={} family={family}",
                     overlay.id
@@ -3402,6 +3531,23 @@ fn update_overlay_bold(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, bold
         if let Some(overlay) = selected_text_overlay_mut(&mut state.project, selected_id.as_deref())
         {
             overlay.font_weight = if bold { 700 } else { 400 };
+            invalidate_overlay_output(&mut state);
+        }
+    }
+    update_timeline_widgets(state, widgets);
+}
+
+fn update_overlay_alignment(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &AppWidgets,
+    alignment: TextAlignment,
+) {
+    {
+        let mut state = state.borrow_mut();
+        let selected_id = state.selected_overlay_id.clone();
+        if let Some(overlay) = selected_text_overlay_mut(&mut state.project, selected_id.as_deref())
+        {
+            overlay.alignment = alignment;
             invalidate_overlay_output(&mut state);
         }
     }
@@ -3736,6 +3882,9 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
     if let Some(row) = &widgets.inspector.overlay_bold {
         row.set_sensitive(has_text_overlay);
     }
+    if let Some(button) = &widgets.inspector.overlay_alignment {
+        button.set_sensitive(has_text_overlay);
+    }
     if let Some(row) = &widgets.inspector.overlay_stroke_width {
         row.set_sensitive(has_text_overlay);
     }
@@ -3768,6 +3917,9 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
         if let Some(row) = &widgets.inspector.overlay_bold {
             row.set_active(text.font_weight >= 600);
         }
+        if let Some(button) = &widgets.inspector.overlay_alignment {
+            button.set_active(text.alignment == TextAlignment::Center);
+        }
         if let Some(row) = &widgets.inspector.overlay_stroke_width {
             row.set_value(text.stroke_width);
         }
@@ -3792,6 +3944,9 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
         }
         if let Some(row) = &widgets.inspector.overlay_bold {
             row.set_active(false);
+        }
+        if let Some(button) = &widgets.inspector.overlay_alignment {
+            button.set_active(false);
         }
         if let Some(row) = &widgets.inspector.overlay_stroke_width {
             row.set_value(1.0);
@@ -4193,14 +4348,6 @@ fn draw_caption_overlay(
         caption_layout(cr, preview_width, preview_height, source_height, text);
     let stroke_width = scaled_text.stroke_width.max(0.0);
 
-    if text.shadow_enabled {
-        let _ = cr.save();
-        cr.move_to(x + 2.0, y + 2.0);
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
-        pangocairo::functions::show_layout(cr, &layout);
-        let _ = cr.restore();
-    }
-
     let _ = cr.save();
     cr.move_to(x, y);
     pangocairo::functions::layout_path(cr, &layout);
@@ -4250,17 +4397,24 @@ fn caption_layout(
     let layout = pangocairo::functions::create_layout(cr);
     layout.set_text(&scaled_text.text);
     layout.set_font_description(Some(&font_description_for_text_overlay(&scaled_text)));
+    layout.set_width((text.bounds.width * preview_width * f64::from(pango::SCALE)).round() as i32);
+    layout.set_wrap(pango::WrapMode::WordChar);
+    if text.alignment == TextAlignment::Center {
+        layout.set_alignment(pango::Alignment::Center);
+    } else {
+        layout.set_alignment(pango::Alignment::Left);
+    }
 
     let x = text.bounds.x * preview_width;
     let y = text.bounds.y * preview_height;
-    let (text_width, text_height) = layout.pixel_size();
+    let (ink_rect, _) = layout.pixel_extents();
     let stroke_width = scaled_text.stroke_width.max(0.0);
     let stroke_padding = stroke_width.ceil();
     let bounds = PixelBounds {
-        x: x - stroke_padding,
-        y: y - stroke_padding,
-        width: f64::from(text_width) + stroke_padding * 2.0,
-        height: f64::from(text_height) + stroke_padding * 2.0,
+        x: x + f64::from(ink_rect.x()) - stroke_padding,
+        y: y + f64::from(ink_rect.y()) - stroke_padding,
+        width: f64::from(ink_rect.width()) + stroke_padding * 2.0,
+        height: f64::from(ink_rect.height()) + stroke_padding * 2.0,
     };
 
     (scaled_text, x, y, layout, bounds)

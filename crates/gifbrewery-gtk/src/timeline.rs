@@ -320,6 +320,33 @@ impl TimelineView {
         });
         area.add_controller(drag);
 
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion({
+            let area = area.clone();
+            let state = Rc::clone(&state);
+            move |_, x, y| {
+                let width = f64::from(area.width());
+                let hit = hit_test(x, y, &state.borrow(), width);
+                match hit {
+                    TimelineHit::ClipStart
+                    | TimelineHit::ClipEnd
+                    | TimelineHit::OverlayStart
+                    | TimelineHit::OverlayEnd => area.set_cursor_from_name(Some("ew-resize")),
+                    TimelineHit::Playhead | TimelineHit::OverlayBody => {
+                        area.set_cursor_from_name(Some("pointer"));
+                    }
+                    TimelineHit::Empty => area.set_cursor_from_name(None),
+                }
+            }
+        });
+        motion.connect_leave({
+            let area = area.clone();
+            move |_| {
+                area.set_cursor_from_name(None);
+            }
+        });
+        area.add_controller(motion);
+
         Self {
             area,
             state,
