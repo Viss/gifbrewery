@@ -1,0 +1,8 @@
+/target/
+/.flatpak-builder/
+/dist/
+*.deb
+*.ddeb
+*.buildinfo
+*.changes
+
