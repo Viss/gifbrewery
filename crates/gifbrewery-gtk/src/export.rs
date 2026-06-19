@@ -272,7 +272,10 @@ fn run_ffmpeg_command(
     duration_seconds: f64,
     progress: Option<&dyn Fn(ExportProgress)>,
 ) -> Result<(), String> {
-    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
