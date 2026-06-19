@@ -65,5 +65,5 @@ cargo run -p gifbrewery-gtk
 Or run the built binary directly:
 
 ```bash
-./target/debug/gifbrewery-gtk
+./target/release/gifbrewery-gtk
 ```
