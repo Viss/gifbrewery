@@ -95,7 +95,6 @@ struct CaptionOverlay {
     area: gtk::DrawingArea,
     texts: Rc<RefCell<Vec<TextOverlay>>>,
     selected_id: Rc<RefCell<Option<String>>>,
-    pixel_bounds: Rc<RefCell<Option<PixelBounds>>>,
     active_bounds: Rc<RefCell<Vec<(String, PixelBounds)>>>,
     source_height: Rc<Cell<f64>>,
     exact_preview_aspect: Rc<Cell<f64>>,
@@ -115,6 +114,12 @@ struct PixelBounds {
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptionDragStart {
+    model_bounds: Rect,
+    pixel_bounds: Option<PixelBounds>,
 }
 
 impl PixelBounds {
@@ -137,7 +142,6 @@ impl CaptionOverlay {
 
         let texts = Rc::new(RefCell::new(initial_texts));
         let selected_id = Rc::new(RefCell::new(selected_id));
-        let pixel_bounds = Rc::new(RefCell::new(None));
         let active_bounds = Rc::new(RefCell::new(Vec::new()));
         let source_height = Rc::new(Cell::new(540.0));
         let exact_preview_aspect = Rc::new(Cell::new(16.0 / 9.0));
@@ -146,7 +150,6 @@ impl CaptionOverlay {
         area.set_draw_func({
             let texts = Rc::clone(&texts);
             let selected_id = Rc::clone(&selected_id);
-            let pixel_bounds = Rc::clone(&pixel_bounds);
             let active_bounds = Rc::clone(&active_bounds);
             let source_height = Rc::clone(&source_height);
             let exact_preview_aspect = Rc::clone(&exact_preview_aspect);
@@ -180,7 +183,6 @@ impl CaptionOverlay {
                 if let Some(bounds) = selected_bounds {
                     draw_selected_caption_bounds(cr, bounds);
                 }
-                *pixel_bounds.borrow_mut() = selected_bounds;
                 *active_bounds.borrow_mut() = bounds_by_id;
             }
         });
@@ -189,7 +191,6 @@ impl CaptionOverlay {
             area,
             texts,
             selected_id,
-            pixel_bounds,
             active_bounds,
             source_height,
             exact_preview_aspect,
@@ -224,10 +225,6 @@ impl CaptionOverlay {
         *self.selected_id.borrow_mut() = selected_id;
         self.area.set_visible(in_range);
         self.area.queue_draw();
-    }
-
-    fn pixel_bounds(&self) -> Option<PixelBounds> {
-        *self.pixel_bounds.borrow()
     }
 
     fn hit_test(&self, x: f64, y: f64) -> Option<(String, PixelBounds)> {
@@ -2011,14 +2008,14 @@ fn install_preview_overlay_drag(state: &Rc<RefCell<AppState>>, widgets: &AppWidg
     caption.area.add_controller(click);
 
     let drag = gtk::GestureDrag::new();
-    let drag_start_bounds = Rc::new(RefCell::new(None::<Rect>));
+    let drag_start = Rc::new(RefCell::new(None::<CaptionDragStart>));
     let drag_active = Rc::new(Cell::new(false));
 
     drag.connect_drag_begin({
         let state = Rc::clone(state);
         let caption = caption.clone();
         let widgets = widgets.clone();
-        let drag_start_bounds = Rc::clone(&drag_start_bounds);
+        let drag_start = Rc::clone(&drag_start);
         let drag_active = Rc::clone(&drag_active);
         move |_, x, y| {
             let _ = caption.area.grab_focus();
@@ -2029,49 +2026,53 @@ fn install_preview_overlay_drag(state: &Rc<RefCell<AppState>>, widgets: &AppWidg
             ));
             drag_active.set(active);
             if !active {
-                *drag_start_bounds.borrow_mut() = None;
+                *drag_start.borrow_mut() = None;
                 return;
             }
 
-            let bounds = {
+            let (id, pixel_bounds) = hit.expect("active hit exists");
+            let model_bounds = {
                 let mut state = state.borrow_mut();
-                let (id, _) = hit.expect("active hit exists");
                 state.selected_overlay_id = Some(id.clone());
                 crate::diagnostics::log_line(format_args!("preview overlay selected: id={id}"));
                 selected_text_overlay(&state.project, Some(id.as_str())).map(|text| text.bounds)
             };
             update_timeline_widgets(&state, &widgets);
-            crate::diagnostics::log_line(format_args!("caption drag start bounds: {bounds:?}"));
-            *drag_start_bounds.borrow_mut() = bounds;
+            let start = model_bounds.map(|model_bounds| CaptionDragStart {
+                model_bounds,
+                pixel_bounds: Some(pixel_bounds),
+            });
+            crate::diagnostics::log_line(format_args!("caption drag start: {start:?}"));
+            *drag_start.borrow_mut() = start;
         }
     });
 
     drag.connect_drag_update({
         let state = Rc::clone(state);
         let widgets = widgets.clone();
-        let drag_start_bounds = Rc::clone(&drag_start_bounds);
+        let drag_start = Rc::clone(&drag_start);
         let drag_active = Rc::clone(&drag_active);
         move |_, offset_x, offset_y| {
             if !drag_active.get() {
                 return;
             }
-            let Some(start_bounds) = *drag_start_bounds.borrow() else {
+            let Some(start) = *drag_start.borrow() else {
                 return;
             };
             crate::diagnostics::log_line(format_args!(
-                "caption drag update: offset=({offset_x:.1},{offset_y:.1}) start_bounds={start_bounds:?}"
+                "caption drag update: offset=({offset_x:.1},{offset_y:.1}) start={start:?}"
             ));
-            update_overlay_position_from_drag(&state, &widgets, start_bounds, offset_x, offset_y);
+            update_overlay_position_from_drag(&state, &widgets, start, offset_x, offset_y);
         }
     });
 
     drag.connect_drag_end({
-        let drag_start_bounds = Rc::clone(&drag_start_bounds);
+        let drag_start = Rc::clone(&drag_start);
         let drag_active = Rc::clone(&drag_active);
         move |_, _, _| {
             crate::diagnostics::log_line(format_args!("caption drag end"));
             drag_active.set(false);
-            *drag_start_bounds.borrow_mut() = None;
+            *drag_start.borrow_mut() = None;
         }
     });
 
@@ -3574,7 +3575,7 @@ fn update_overlay_stroke_width(
 fn update_overlay_position_from_drag(
     state: &Rc<RefCell<AppState>>,
     widgets: &AppWidgets,
-    start_bounds: Rect,
+    start: CaptionDragStart,
     offset_x: f64,
     offset_y: f64,
 ) {
@@ -3597,30 +3598,25 @@ fn update_overlay_position_from_drag(
             }
         }
     };
-    let caption_bounds = widgets
-        .editor
-        .caption_overlay
-        .as_ref()
-        .and_then(CaptionOverlay::pixel_bounds);
     let content_width = content_rect.width.max(1.0);
     let content_height = content_rect.height.max(1.0);
-    let (min_x, max_x, min_y, max_y) = if let Some(bounds) = caption_bounds {
+    let (min_x, max_x, min_y, max_y) = if let Some(bounds) = start.pixel_bounds {
         let ink_left = (bounds.x - content_rect.x) / content_width;
         let ink_right = (bounds.x + bounds.width - content_rect.x) / content_width;
         let ink_top = (bounds.y - content_rect.y) / content_height;
         let ink_bottom = (bounds.y + bounds.height - content_rect.y) / content_height;
         (
-            start_bounds.x - ink_left,
-            1.0 - (ink_right - start_bounds.x),
-            start_bounds.y - ink_top,
-            1.0 - (ink_bottom - start_bounds.y),
+            start.model_bounds.x - ink_left,
+            1.0 - (ink_right - start.model_bounds.x),
+            start.model_bounds.y - ink_top,
+            1.0 - (ink_bottom - start.model_bounds.y),
         )
     } else {
         (
             0.0,
-            (1.0 - start_bounds.width).max(0.0),
+            (1.0 - start.model_bounds.width).max(0.0),
             0.0,
-            (1.0 - start_bounds.height).max(0.0),
+            (1.0 - start.model_bounds.height).max(0.0),
         )
     };
 
@@ -3630,13 +3626,13 @@ fn update_overlay_position_from_drag(
         if let Some(overlay) = selected_text_overlay_mut(&mut state.project, selected_id.as_deref())
         {
             overlay.bounds.x =
-                (start_bounds.x + offset_x / content_width).clamp(min_x, max_x.max(min_x));
+                (start.model_bounds.x + offset_x / content_width).clamp(min_x, max_x.max(min_x));
             overlay.bounds.y =
-                (start_bounds.y + offset_y / content_height).clamp(min_y, max_y.max(min_y));
+                (start.model_bounds.y + offset_y / content_height).clamp(min_y, max_y.max(min_y));
             let bounds = overlay.bounds;
             invalidate_overlay_output(&mut state);
             crate::diagnostics::log_line(format_args!(
-                "caption drag computed: preview=({preview_width:.1}x{preview_height:.1}) content={content_rect:?} caption_bounds={caption_bounds:?} clamp=({min_x:.4},{max_x:.4},{min_y:.4},{max_y:.4}) new_bounds={:?}",
+                "caption drag computed: preview=({preview_width:.1}x{preview_height:.1}) content={content_rect:?} start={start:?} clamp=({min_x:.4},{max_x:.4},{min_y:.4},{max_y:.4}) new_bounds={:?}",
                 bounds
             ));
         }
