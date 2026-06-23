@@ -3580,27 +3580,63 @@ fn update_overlay_position_from_drag(
 ) {
     let preview_width = f64::from(widgets.editor.preview.width()).max(1.0);
     let preview_height = f64::from(widgets.editor.preview.height()).max(1.0);
+    let content_rect = {
+        let state = state.borrow();
+        if uses_rendered_output_preview(&state.project) {
+            contained_rect(
+                preview_width,
+                preview_height,
+                rendered_preview_aspect(&state.project),
+            )
+        } else {
+            PixelBounds {
+                x: 0.0,
+                y: 0.0,
+                width: preview_width,
+                height: preview_height,
+            }
+        }
+    };
     let caption_bounds = widgets
         .editor
         .caption_overlay
         .as_ref()
         .and_then(CaptionOverlay::pixel_bounds);
-    let caption_width = caption_bounds.map(|bounds| bounds.width).unwrap_or(1.0);
-    let caption_height = caption_bounds.map(|bounds| bounds.height).unwrap_or(1.0);
+    let content_width = content_rect.width.max(1.0);
+    let content_height = content_rect.height.max(1.0);
+    let (min_x, max_x, min_y, max_y) = if let Some(bounds) = caption_bounds {
+        let ink_left = (bounds.x - content_rect.x) / content_width;
+        let ink_right = (bounds.x + bounds.width - content_rect.x) / content_width;
+        let ink_top = (bounds.y - content_rect.y) / content_height;
+        let ink_bottom = (bounds.y + bounds.height - content_rect.y) / content_height;
+        (
+            start_bounds.x - ink_left,
+            1.0 - (ink_right - start_bounds.x),
+            start_bounds.y - ink_top,
+            1.0 - (ink_bottom - start_bounds.y),
+        )
+    } else {
+        (
+            0.0,
+            (1.0 - start_bounds.width).max(0.0),
+            0.0,
+            (1.0 - start_bounds.height).max(0.0),
+        )
+    };
 
     {
         let mut state = state.borrow_mut();
         let selected_id = state.selected_overlay_id.clone();
         if let Some(overlay) = selected_text_overlay_mut(&mut state.project, selected_id.as_deref())
         {
-            let max_x = (1.0 - caption_width / preview_width).max(0.0);
-            let max_y = (1.0 - caption_height / preview_height).max(0.0);
-            overlay.bounds.x = (start_bounds.x + offset_x / preview_width).clamp(0.0, max_x);
-            overlay.bounds.y = (start_bounds.y + offset_y / preview_height).clamp(0.0, max_y);
+            overlay.bounds.x =
+                (start_bounds.x + offset_x / content_width).clamp(min_x, max_x.max(min_x));
+            overlay.bounds.y =
+                (start_bounds.y + offset_y / content_height).clamp(min_y, max_y.max(min_y));
             let bounds = overlay.bounds;
             invalidate_overlay_output(&mut state);
             crate::diagnostics::log_line(format_args!(
-                "caption drag computed: preview=({preview_width:.1}x{preview_height:.1}) caption_bounds={caption_bounds:?} max=({max_x:.4},{max_y:.4}) new_bounds={:?}",
+                "caption drag computed: preview=({preview_width:.1}x{preview_height:.1}) content={content_rect:?} caption_bounds={caption_bounds:?} clamp=({min_x:.4},{max_x:.4},{min_y:.4},{max_y:.4}) new_bounds={:?}",
                 bounds
             ));
         }
