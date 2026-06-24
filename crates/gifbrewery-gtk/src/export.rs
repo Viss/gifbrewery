@@ -138,7 +138,7 @@ pub fn render_frame_sequence(
         )
     })?;
 
-    let output_pattern = output_dir.join("frame-%06d.png");
+    let output_pattern = output_dir.join("frame-%06d.jpg");
     let result = run_ffmpeg_command(
         Command::new("ffmpeg")
             .arg("-hide_banner")
@@ -154,6 +154,8 @@ pub fn render_frame_sequence(
             .arg(&source.path)
             .arg("-filter_complex")
             .arg(video_filter)
+            .arg("-q:v")
+            .arg("5")
             .arg("-start_number")
             .arg("0")
             .arg(output_pattern),
@@ -174,7 +176,7 @@ pub fn render_frame_sequence(
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("frame-") && name.ends_with(".png"))
+                .is_some_and(|name| name.starts_with("frame-") && name.ends_with(".jpg"))
         })
         .collect::<Vec<_>>();
     frames.sort();
@@ -395,20 +397,30 @@ impl RenderGeometry {
         let crop = normalized_crop(clip.crop);
         let crop_width = f64::from(source_width) * (1.0 - crop.left - crop.right).max(0.01);
         let crop_height = f64::from(source_height) * (1.0 - crop.top - crop.bottom).max(0.01);
-        let output_width = project
-            .settings
-            .gif
-            .output_width
-            .filter(|width| *width > 0)
-            .unwrap_or_else(|| (crop_width * auto_scale).round() as u32)
-            .max(1);
-        let output_height = project
+        let aspect = crop_width / crop_height.max(1.0);
+        let configured_width = project.settings.gif.output_width.filter(|width| *width > 0);
+        let configured_height = project
             .settings
             .gif
             .output_height
-            .filter(|height| *height > 0)
-            .unwrap_or_else(|| (crop_height * auto_scale).round() as u32)
-            .max(1);
+            .filter(|height| *height > 0);
+        let (output_width, output_height) = match (configured_width, configured_height) {
+            (Some(width), Some(height)) => (width.max(1), height.max(1)),
+            (Some(width), None) => {
+                let width = width.max(1);
+                let height = (f64::from(width) / aspect).round().max(1.0) as u32;
+                (width, height)
+            }
+            (None, Some(height)) => {
+                let height = height.max(1);
+                let width = (f64::from(height) * aspect).round().max(1.0) as u32;
+                (width, height)
+            }
+            (None, None) => (
+                (crop_width * auto_scale).round().max(1.0) as u32,
+                (crop_height * auto_scale).round().max(1.0) as u32,
+            ),
+        };
 
         Self {
             source_height,
@@ -629,15 +641,76 @@ fn drawtext_filter(
         text.range.end_seconds
     ));
 
+    let mut filters = Vec::new();
+    let stroke_radius = stroke_width.max(0.0) as i32;
+    if stroke_radius > 0 {
+        let stroke_color = ffmpeg_color(text.stroke_color);
+        for (dx, dy) in square_stroke_offsets(stroke_radius) {
+            filters.push(drawtext_filter_at_offset(
+                &escaped_text_file,
+                &font_argument,
+                font_size,
+                &stroke_color,
+                &x,
+                &y,
+                dx,
+                dy,
+                &enable,
+            ));
+        }
+    }
+    filters.push(drawtext_filter_at_offset(
+        &escaped_text_file,
+        &font_argument,
+        font_size,
+        &ffmpeg_color(text.text_color),
+        &x,
+        &y,
+        0,
+        0,
+        &enable,
+    ));
+    filters.join(",")
+}
+
+fn square_stroke_offsets(radius: i32) -> Vec<(i32, i32)> {
+    let mut offsets = Vec::new();
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            offsets.push((dx, dy));
+        }
+    }
+    offsets
+}
+
+fn drawtext_filter_at_offset(
+    escaped_text_file: &str,
+    font_argument: &str,
+    font_size: f64,
+    color: &str,
+    x: &str,
+    y: &str,
+    dx: i32,
+    dy: i32,
+    enable: &str,
+) -> String {
     format!(
         "drawtext=textfile='{escaped_text_file}':{font_argument}:fontsize={font_size:.0}:\
-         fontcolor={text_color}:bordercolor={stroke_color}:borderw={stroke_width:.0}:\
-         x='{x}':y='{y}':enable='{enable}'",
-        font_size = font_size,
-        text_color = ffmpeg_color(text.text_color),
-        stroke_color = ffmpeg_color(text.stroke_color),
-        stroke_width = stroke_width,
+         fontcolor={color}:borderw=0:x='{x_offset}':y='{y_offset}':enable='{enable}'",
+        x_offset = offset_expression(x, dx),
+        y_offset = offset_expression(y, dy),
     )
+}
+
+fn offset_expression(expression: &str, offset: i32) -> String {
+    match offset.cmp(&0) {
+        std::cmp::Ordering::Greater => format!("({expression})+{offset}"),
+        std::cmp::Ordering::Less => format!("({expression}){offset}"),
+        std::cmp::Ordering::Equal => expression.to_string(),
+    }
 }
 
 fn drawtext_font_argument(font_family: &str, font_weight: u32) -> String {
@@ -753,7 +826,8 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::gif_loop_count;
+    use super::{gif_loop_count, RenderGeometry};
+    use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
 
     fn gif_with_loop_count(count: u16) -> Vec<u8> {
         let [low, high] = count.to_le_bytes();
@@ -779,5 +853,57 @@ mod tests {
     #[test]
     fn missing_loop_extension_is_none() {
         assert_eq!(gif_loop_count(b"GIF89a"), None);
+    }
+
+    #[test]
+    fn width_only_resize_preserves_crop_aspect() {
+        let mut project = geometry_test_project();
+        project.settings.gif.output_width = Some(300);
+        project.settings.gif.output_height = None;
+
+        let clip = project.clips.first().expect("default project has a clip");
+        let geometry = RenderGeometry::from_project(&project, clip, 1.0);
+
+        assert_eq!(geometry.output_width, 300);
+        assert_eq!(geometry.output_height, 150);
+    }
+
+    #[test]
+    fn height_only_resize_preserves_crop_aspect() {
+        let mut project = geometry_test_project();
+        project.settings.gif.output_width = None;
+        project.settings.gif.output_height = Some(125);
+
+        let clip = project.clips.first().expect("default project has a clip");
+        let geometry = RenderGeometry::from_project(&project, clip, 1.0);
+
+        assert_eq!(geometry.output_width, 250);
+        assert_eq!(geometry.output_height, 125);
+    }
+
+    fn geometry_test_project() -> Project {
+        let mut project = Project::default();
+        project.source = Some(MediaSource {
+            path: "test.gif".to_string(),
+            duration_seconds: Some(2.0),
+            natural_width: Some(800),
+            natural_height: Some(400),
+            fps: Some(25.0),
+        });
+        let clip = project
+            .clips
+            .first_mut()
+            .expect("default project has a clip");
+        clip.range = TimelineRange {
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+        };
+        clip.crop = Some(CropRect {
+            left: 0.125,
+            right: 0.125,
+            top: 0.0,
+            bottom: 0.25,
+        });
+        project
     }
 }

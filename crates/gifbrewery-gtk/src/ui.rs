@@ -18,6 +18,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+const MAX_INTERACTIVE_PREVIEW_EDGE: u32 = 640;
+const MAX_AUTO_PRELOAD_FRAME_PIXELS: u64 = 30_000_000;
+const RENDERED_PLAYBACK_RESCALE_DEBOUNCE_MS: u64 = 2_000;
+
 #[derive(Clone)]
 pub struct AppHandle {
     window: adw::ApplicationWindow,
@@ -51,6 +55,8 @@ struct AppState {
     rendered_playback_generation: u64,
     rendered_playback_preparing: bool,
     rendered_playback_rebuild_requested: bool,
+    rendered_playback_preload_deferred: bool,
+    rendered_playback_preload_debounce: u64,
     rendered_playback_tick: Option<Instant>,
 }
 
@@ -332,6 +338,8 @@ struct InspectorWidgets {
 }
 
 pub fn build_main_window(app: &adw::Application) -> AppHandle {
+    cleanup_stale_preview_cache_dirs();
+
     let state = Rc::new(RefCell::new(AppState {
         project: Project::default(),
         selected_overlay_id: None,
@@ -348,6 +356,8 @@ pub fn build_main_window(app: &adw::Application) -> AppHandle {
         rendered_playback_generation: 0,
         rendered_playback_preparing: false,
         rendered_playback_rebuild_requested: false,
+        rendered_playback_preload_deferred: false,
+        rendered_playback_preload_debounce: 0,
         rendered_playback_tick: None,
     }));
 
@@ -735,10 +745,23 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
     let page = adw::PreferencesPage::new();
     let group = adw::PreferencesGroup::builder().title("Clip").build();
     let clip = project.clips.first().expect("default project has a clip");
+    let max_frame = max_media_frame_index(project) as f64;
 
-    let start = spin_row("Start", clip.range.start_seconds, 0.0, 3600.0, 0.01);
+    let start = spin_row(
+        "Start frame",
+        frame_index_for_seconds(project, clip.range.start_seconds) as f64,
+        0.0,
+        max_frame,
+        1.0,
+    );
     group.add(&start);
-    let end = spin_row("End", clip.range.end_seconds, 0.01, 3600.0, 0.01);
+    let end = spin_row(
+        "End frame",
+        frame_index_for_seconds(project, clip.range.end_seconds) as f64,
+        1.0,
+        max_frame.max(1.0),
+        1.0,
+    );
     group.add(&end);
     let speed = spin_row("Speed", clip.speed, 0.05, 8.0, 0.05);
     group.add(&speed);
@@ -815,16 +838,20 @@ fn build_gif_page(project: &Project) -> (gtk::ScrolledWindow, GifInspectorWidget
 
     let size_group = adw::PreferencesGroup::builder().title("Resize").build();
     let output_width = spin_row(
-        "Width (0 = source)",
-        settings.output_width.map(f64::from).unwrap_or(0.0),
+        "Width",
+        effective_output_dimensions(project)
+            .map(|(width, _)| f64::from(width))
+            .unwrap_or_else(|| settings.output_width.map(f64::from).unwrap_or(0.0)),
         0.0,
         4096.0,
         2.0,
     );
     size_group.add(&output_width);
     let output_height = spin_row(
-        "Height (0 = source)",
-        settings.output_height.map(f64::from).unwrap_or(0.0),
+        "Height",
+        effective_output_dimensions(project)
+            .map(|(_, height)| f64::from(height))
+            .unwrap_or_else(|| settings.output_height.map(f64::from).unwrap_or(0.0)),
         0.0,
         4096.0,
         2.0,
@@ -1329,6 +1356,118 @@ fn clip_fps_value(strategy: &FrameStrategy) -> f64 {
     }
 }
 
+fn project_frame_fps(project: &Project) -> f64 {
+    source_frame_fps(project)
+        .or_else(|| {
+            project
+                .clips
+                .first()
+                .map(|clip| clip_fps_value(&clip.frame_strategy))
+        })
+        .unwrap_or(12.0)
+        .clamp(1.0, 240.0)
+}
+
+fn frame_duration_seconds(project: &Project) -> f64 {
+    1.0 / project_frame_fps(project)
+}
+
+fn frame_index_for_seconds(project: &Project, seconds: f64) -> i64 {
+    let fps = project_frame_fps(project);
+    let max_frame = max_media_frame_index(project);
+    ((seconds.max(0.0) * fps).round() as i64).clamp(0, max_frame)
+}
+
+fn seconds_for_frame_index(project: &Project, frame: i64) -> f64 {
+    let fps = project_frame_fps(project);
+    let duration = project_duration_seconds(project)
+        .or_else(|| project.clips.first().map(|clip| clip.range.end_seconds))
+        .unwrap_or(3.0)
+        .max(0.01);
+    let frame = frame.clamp(0, max_media_frame_index(project));
+    (frame as f64 / fps).clamp(0.0, duration)
+}
+
+fn snap_seconds_to_project_frame(project: &Project, seconds: f64) -> f64 {
+    seconds_for_frame_index(project, frame_index_for_seconds(project, seconds))
+}
+
+fn max_media_frame_index(project: &Project) -> i64 {
+    let fps = project_frame_fps(project);
+    let duration = project_duration_seconds(project)
+        .or_else(|| project.clips.first().map(|clip| clip.range.end_seconds))
+        .unwrap_or(3.0)
+        .max(0.01);
+    (duration * fps).floor().max(1.0) as i64
+}
+
+fn cropped_source_dimensions(project: &Project) -> Option<(f64, f64)> {
+    let source = project.source.as_ref()?;
+    let source_width = f64::from(source.natural_width?.max(1));
+    let source_height = f64::from(source.natural_height?.max(1));
+    let crop = project.clips.first().and_then(|clip| clip.crop);
+    let crop = crop.unwrap_or(CropRect {
+        left: 0.0,
+        right: 0.0,
+        top: 0.0,
+        bottom: 0.0,
+    });
+    let width_fraction =
+        (1.0 - crop.left.clamp(0.0, 0.95) - crop.right.clamp(0.0, 0.95)).clamp(0.02, 1.0);
+    let height_fraction =
+        (1.0 - crop.top.clamp(0.0, 0.95) - crop.bottom.clamp(0.0, 0.95)).clamp(0.02, 1.0);
+    Some((
+        (source_width * width_fraction).max(1.0),
+        (source_height * height_fraction).max(1.0),
+    ))
+}
+
+fn output_aspect_ratio(project: &Project) -> f64 {
+    cropped_source_dimensions(project)
+        .map(|(width, height)| width / height.max(1.0))
+        .unwrap_or(16.0 / 9.0)
+        .max(0.01)
+}
+
+fn paired_output_height_for_width(project: &Project, width: u32) -> u32 {
+    (f64::from(width.max(1)) / output_aspect_ratio(project))
+        .round()
+        .max(1.0) as u32
+}
+
+fn paired_output_width_for_height(project: &Project, height: u32) -> u32 {
+    (f64::from(height.max(1)) * output_aspect_ratio(project))
+        .round()
+        .max(1.0) as u32
+}
+
+fn effective_output_dimensions(project: &Project) -> Option<(u32, u32)> {
+    let crop_dimensions = cropped_source_dimensions(project).map(|(width, height)| {
+        (
+            width.round().max(1.0) as u32,
+            height.round().max(1.0) as u32,
+        )
+    });
+    match (
+        project.settings.gif.output_width,
+        project.settings.gif.output_height,
+    ) {
+        (Some(width), Some(height)) => Some((width.max(1), height.max(1))),
+        (Some(width), None) => Some((width.max(1), paired_output_height_for_width(project, width))),
+        (None, Some(height)) => Some((
+            paired_output_width_for_height(project, height),
+            height.max(1),
+        )),
+        (None, None) => crop_dimensions,
+    }
+}
+
+fn reflow_output_height_from_width(project: &mut Project) {
+    if let Some(width) = project.settings.gif.output_width {
+        project.settings.gif.output_height = Some(paired_output_height_for_width(project, width));
+    }
+}
+
 fn scrolled_page(page: adw::PreferencesPage) -> gtk::ScrolledWindow {
     gtk::ScrolledWindow::builder()
         .child(&page)
@@ -1515,7 +1654,7 @@ fn install_widget_bindings(
                 if state.borrow().syncing_widgets {
                     return;
                 }
-                update_clip_start(&state, &widgets, row.value());
+                update_clip_start_frame(&state, &widgets, row.value());
             }
         });
 
@@ -1529,7 +1668,7 @@ fn install_widget_bindings(
                 if state.borrow().syncing_widgets {
                     return;
                 }
-                update_clip_end(&state, &widgets, row.value());
+                update_clip_end_frame(&state, &widgets, row.value());
             }
         });
 
@@ -2177,6 +2316,13 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
     if let Some((path, duration)) = thumbnail_source {
         start_thumbnail_worker(state, widgets, path.to_path_buf(), duration);
     }
+    if should_auto_preload_rendered_playback(&state.borrow().project) {
+        start_rendered_playback_preload(state, widgets, "source loaded");
+    } else {
+        crate::diagnostics::log_line(format_args!(
+            "rendered sequence preload skipped on source load: estimated cache too large"
+        ));
+    }
     widgets.editor.export_button.set_sensitive(true);
 }
 
@@ -2316,7 +2462,7 @@ fn start_rendered_playback_preload(
                 "rendered sequence preload discarded stale cache"
             ));
             if should_restart {
-                start_rendered_playback_preload(&state, &widgets, "coalesced project changes");
+                defer_rendered_playback_preload(&state, &widgets, "coalesced project changes");
             }
             return glib::ControlFlow::Break;
         }
@@ -2368,12 +2514,8 @@ fn start_rendered_playback_preload(
                     state.rendered_playback_rebuild_requested = false;
                     state.rendered_playback_cache = None;
                 }
-                widgets
-                    .editor
-                    .source_title
-                    .set_label("Preview frame cache failed");
-                widgets.editor.export_status.set_label(&err);
-                widgets.editor.export_status.set_visible(true);
+                widgets.editor.source_title.set_label("Preview ready");
+                widgets.editor.export_status.set_visible(false);
                 crate::diagnostics::log_line(format_args!(
                     "rendered sequence preload failed: {err}"
                 ));
@@ -2857,7 +2999,8 @@ fn update_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, seconds:
                 .map(|clip| clip.range.end_seconds)
                 .unwrap_or(3.0)
         });
-        state.playhead_seconds = seconds.clamp(0.0, duration.max(0.01));
+        state.playhead_seconds =
+            snap_seconds_to_project_frame(&state.project, seconds).clamp(0.0, duration.max(0.01));
     }
     update_timeline_widgets(state, widgets);
 }
@@ -2895,13 +3038,15 @@ fn step_playhead_by_frames(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, 
     update_playhead(state, widgets, next_seconds);
 }
 
-fn update_clip_start(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, start_seconds: f64) {
+fn update_clip_start_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, start_frame: f64) {
     {
         let mut state = state.borrow_mut();
         state.is_playing = false;
+        let start_seconds = seconds_for_frame_index(&state.project, start_frame.round() as i64);
         let media_end = project_duration_seconds(&state.project).unwrap_or(3600.0);
+        let frame_gap = frame_duration_seconds(&state.project);
         if let Some(clip) = state.project.clips.first_mut() {
-            let max_start = (clip.range.end_seconds - 0.01).max(0.0);
+            let max_start = (clip.range.end_seconds - frame_gap).max(0.0);
             clip.range.start_seconds = start_seconds.clamp(0.0, max_start.min(media_end));
             let clip_start = clip.range.start_seconds;
             state.playhead_seconds = clip_start;
@@ -2910,25 +3055,27 @@ fn update_clip_start(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, start_
         }
     }
     update_timeline_widgets(state, widgets);
+    defer_rendered_playback_preload(state, widgets, "clip start updated");
 }
 
-fn update_clip_end(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, end_seconds: f64) {
+fn update_clip_end_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, end_frame: f64) {
     {
         let mut state = state.borrow_mut();
         state.is_playing = false;
+        let end_seconds = seconds_for_frame_index(&state.project, end_frame.round() as i64);
         let media_end = project_duration_seconds(&state.project).unwrap_or(3600.0);
+        let frame_gap = frame_duration_seconds(&state.project);
         if let Some(clip) = state.project.clips.first_mut() {
-            let min_end = clip.range.start_seconds + 0.01;
+            let min_end = clip.range.start_seconds + frame_gap;
             clip.range.end_seconds = end_seconds.clamp(min_end, media_end.max(min_end));
             let clip_range = clip.range;
-            state.playhead_seconds = state
-                .playhead_seconds
-                .clamp(clip_range.start_seconds, clip_range.end_seconds);
+            state.playhead_seconds = clip_range.end_seconds;
             clamp_overlays_to_clip(&mut state.project);
             invalidate_exact_preview_output(&mut state);
         }
     }
     update_timeline_widgets(state, widgets);
+    defer_rendered_playback_preload(state, widgets, "clip end updated");
 }
 
 fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, _megabytes: f64) {
@@ -2984,20 +3131,36 @@ fn update_high_quality_quantization(
 fn update_output_width(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, width: f64) {
     {
         let mut state = state.borrow_mut();
-        let width = width.round() as u32;
-        state.project.settings.gif.output_width = (width >= 2).then_some(width);
-        invalidate_render_outputs(&mut state);
+        let width = width.round().max(0.0) as u32;
+        if width >= 2 {
+            let height = paired_output_height_for_width(&state.project, width);
+            state.project.settings.gif.output_width = Some(width);
+            state.project.settings.gif.output_height = Some(height);
+        } else {
+            state.project.settings.gif.output_width = None;
+            state.project.settings.gif.output_height = None;
+        }
+        invalidate_exact_preview_output(&mut state);
     }
+    defer_rendered_playback_preload(state, widgets, "resize width updated");
     update_timeline_widgets(state, widgets);
 }
 
 fn update_output_height(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, height: f64) {
     {
         let mut state = state.borrow_mut();
-        let height = height.round() as u32;
-        state.project.settings.gif.output_height = (height >= 2).then_some(height);
-        invalidate_render_outputs(&mut state);
+        let height = height.round().max(0.0) as u32;
+        if height >= 2 {
+            let width = paired_output_width_for_height(&state.project, height);
+            state.project.settings.gif.output_width = Some(width);
+            state.project.settings.gif.output_height = Some(height);
+        } else {
+            state.project.settings.gif.output_width = None;
+            state.project.settings.gif.output_height = None;
+        }
+        invalidate_exact_preview_output(&mut state);
     }
+    defer_rendered_playback_preload(state, widgets, "resize height updated");
     update_timeline_widgets(state, widgets);
 }
 
@@ -3040,8 +3203,10 @@ fn update_clip_crop_margin(
             } else {
                 Some(crop)
             };
-        invalidate_render_outputs(&mut state);
+        reflow_output_height_from_width(&mut state.project);
+        invalidate_exact_preview_output(&mut state);
     }
+    defer_rendered_playback_preload(state, widgets, "crop updated");
     update_timeline_widgets(state, widgets);
 }
 
@@ -3063,12 +3228,14 @@ fn update_clip_range(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, range:
         let mut state = state.borrow_mut();
         state.is_playing = false;
         let media_end = project_duration_seconds(&state.project).unwrap_or(3600.0);
+        let frame_gap = frame_duration_seconds(&state.project);
+        let start_seconds = snap_seconds_to_project_frame(&state.project, range.start_seconds)
+            .clamp(0.0, media_end);
+        let min_end = start_seconds + frame_gap;
+        let end_seconds = snap_seconds_to_project_frame(&state.project, range.end_seconds)
+            .clamp(min_end, media_end.max(min_end));
         if let Some(clip) = state.project.clips.first_mut() {
             let old_start_seconds = clip.range.start_seconds;
-            let start_seconds = range.start_seconds.clamp(0.0, media_end);
-            let end_seconds = range
-                .end_seconds
-                .clamp(start_seconds + 0.01, media_end.max(start_seconds + 0.01));
             clip.range = TimelineRange {
                 start_seconds,
                 end_seconds,
@@ -3082,6 +3249,7 @@ fn update_clip_range(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, range:
         }
     }
     update_timeline_widgets(state, widgets);
+    defer_rendered_playback_preload(state, widgets, "clip range updated");
 }
 
 fn selected_text_overlay<'a>(
@@ -3721,6 +3889,9 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
         overlay_labels,
         playhead_seconds,
         timeline_state,
+        clip_start_frame,
+        clip_end_frame,
+        max_frame,
     ) = {
         let state = state.borrow();
         let clip = state
@@ -3734,6 +3905,9 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
         let overlay_range = text_overlay.as_ref().map(|text| text.range);
         let selected_overlay_index =
             selected_overlay_index(&state.project, selected_overlay_id.as_deref());
+        let clip_start_frame = frame_index_for_seconds(&state.project, clip.range.start_seconds);
+        let clip_end_frame = frame_index_for_seconds(&state.project, clip.range.end_seconds);
+        let max_frame = max_media_frame_index(&state.project);
         (
             clip.range,
             overlay_range,
@@ -3749,14 +3923,17 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
                 state.playhead_seconds,
                 state.thumbnails.clone(),
             ),
+            clip_start_frame,
+            clip_end_frame,
+            max_frame,
         )
     };
 
     state.borrow_mut().syncing_widgets = true;
 
     widgets.editor.time_label.set_label(&format!(
-        "{:.2}s - {:.2}s",
-        clip_range.start_seconds, clip_range.end_seconds
+        "Frames {}-{} ({:.2}s - {:.2}s)",
+        clip_start_frame, clip_end_frame, clip_range.start_seconds, clip_range.end_seconds
     ));
     widgets.editor.timeline_view.set_state(timeline_state);
     widgets.inspector.target_size_mb.set_value(
@@ -3772,8 +3949,18 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
     widgets
         .inspector
         .clip_start
-        .set_value(clip_range.start_seconds);
-    widgets.inspector.clip_end.set_value(clip_range.end_seconds);
+        .adjustment()
+        .set_upper(max_frame as f64);
+    widgets
+        .inspector
+        .clip_end
+        .adjustment()
+        .set_upper((max_frame as f64).max(1.0));
+    widgets
+        .inspector
+        .clip_start
+        .set_value(clip_start_frame as f64);
+    widgets.inspector.clip_end.set_value(clip_end_frame as f64);
     widgets.inspector.clip_speed.set_value(
         state
             .borrow()
@@ -3804,24 +3991,15 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
             .gif
             .high_quality_quantization,
     );
+    let output_dimensions = effective_output_dimensions(&state.borrow().project);
     widgets.inspector.output_width.set_value(
-        state
-            .borrow()
-            .project
-            .settings
-            .gif
-            .output_width
-            .map(f64::from)
+        output_dimensions
+            .map(|(width, _)| f64::from(width))
             .unwrap_or(0.0),
     );
     widgets.inspector.output_height.set_value(
-        state
-            .borrow()
-            .project
-            .settings
-            .gif
-            .output_height
-            .map(f64::from)
+        output_dimensions
+            .map(|(_, height)| f64::from(height))
             .unwrap_or(0.0),
     );
     let clip_crop = state
@@ -3997,7 +4175,6 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
 
     state.borrow_mut().syncing_widgets = false;
     refresh_exact_preview_frame(state, widgets);
-    start_rendered_playback_preload(state, widgets, "timeline/model updated");
 }
 
 fn refresh_exact_preview_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
@@ -4159,11 +4336,50 @@ fn invalidate_render_outputs(state: &mut AppState) {
     invalidate_exact_preview_output(state);
     state.rendered_playback_cache = None;
     state.rendered_playback_generation = state.rendered_playback_generation.wrapping_add(1);
+    state.rendered_playback_preload_deferred = false;
     state.rendered_playback_rebuild_requested = true;
     if !state.rendered_playback_preparing {
         state.rendered_playback_rebuild_requested = false;
     }
     state.rendered_playback_tick = None;
+}
+
+fn defer_rendered_playback_preload(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &AppWidgets,
+    reason: &'static str,
+) {
+    let token = {
+        let mut state = state.borrow_mut();
+        state.rendered_playback_cache = None;
+        state.rendered_playback_generation = state.rendered_playback_generation.wrapping_add(1);
+        state.rendered_playback_preload_deferred = true;
+        state.rendered_playback_rebuild_requested = false;
+        state.rendered_playback_tick = None;
+        state.rendered_playback_preload_debounce =
+            state.rendered_playback_preload_debounce.wrapping_add(1);
+        state.rendered_playback_preload_debounce
+    };
+
+    let state = Rc::clone(state);
+    let widgets = widgets.clone();
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(RENDERED_PLAYBACK_RESCALE_DEBOUNCE_MS),
+        move || {
+            let should_start = {
+                let mut state = state.borrow_mut();
+                if state.rendered_playback_preload_debounce != token {
+                    return glib::ControlFlow::Break;
+                }
+                state.rendered_playback_preload_deferred = false;
+                state.project.source.is_some()
+            };
+            if should_start {
+                start_rendered_playback_preload(&state, &widgets, reason);
+            }
+            glib::ControlFlow::Break
+        },
+    );
 }
 
 fn invalidate_exact_preview_output(state: &mut AppState) {
@@ -4192,25 +4408,79 @@ fn rendered_playback_sequence_dir(key: &str) -> PathBuf {
         .join(format!("{:016x}", hasher.finish()))
 }
 
-fn playback_preload_project(project: &Project) -> Project {
-    let mut project = base_preview_project(project);
-    let duration = project_duration_seconds(&project)
-        .or_else(|| project.clips.first().map(|clip| clip.range.end_seconds))
-        .unwrap_or(0.01)
-        .max(0.01);
-    if let Some(clip) = project.clips.first_mut() {
-        clip.range = TimelineRange {
-            start_seconds: 0.0,
-            end_seconds: duration,
+fn cleanup_stale_preview_cache_dirs() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
         };
+        if name.starts_with("gifbrewery-rendered-playback-")
+            || name.starts_with("gifbrewery-rendered-preview-")
+            || name.starts_with("gifbrewery-export-preview-")
+        {
+            let _ = fs::remove_dir_all(path);
+        }
     }
-    project
+}
+
+fn playback_preload_project(project: &Project) -> Project {
+    base_preview_project(project)
+}
+
+fn should_auto_preload_rendered_playback(project: &Project) -> bool {
+    let project = playback_preload_project(project);
+    let Some((width, height)) = effective_output_dimensions(&project) else {
+        return false;
+    };
+    let Some(clip) = project.clips.first() else {
+        return false;
+    };
+    let duration = clip.range.duration_seconds().max(0.01);
+    let fps = source_frame_fps(&project)
+        .unwrap_or_else(|| clip_fps_value(&clip.frame_strategy))
+        .clamp(1.0, 120.0);
+    let estimated_frame_pixels =
+        u64::from(width) * u64::from(height) * (duration * fps).ceil().max(1.0) as u64;
+    if estimated_frame_pixels > MAX_AUTO_PRELOAD_FRAME_PIXELS {
+        crate::diagnostics::log_line(format_args!(
+            "rendered sequence preload auto-skip estimate: output={}x{} duration={duration:.3}s fps={fps:.1} frame_pixels={estimated_frame_pixels}",
+            width, height
+        ));
+        return false;
+    }
+    true
 }
 
 fn base_preview_project(project: &Project) -> Project {
     let mut project = project.clone();
     project.overlays.clear();
+    apply_interactive_preview_size_cap(&mut project);
     project
+}
+
+fn apply_interactive_preview_size_cap(project: &mut Project) {
+    let Some((width, height)) = effective_output_dimensions(project) else {
+        return;
+    };
+    let max_edge = width.max(height);
+    if max_edge <= MAX_INTERACTIVE_PREVIEW_EDGE {
+        project.settings.gif.output_width = Some(width.max(1));
+        project.settings.gif.output_height = Some(height.max(1));
+        return;
+    }
+
+    let scale = f64::from(MAX_INTERACTIVE_PREVIEW_EDGE) / f64::from(max_edge);
+    let preview_width = (f64::from(width) * scale).round().max(1.0) as u32;
+    let preview_height = (f64::from(height) * scale).round().max(1.0) as u32;
+    crate::diagnostics::log_line(format_args!(
+        "interactive preview size capped: source_output={}x{} preview={}x{}",
+        width, height, preview_width, preview_height
+    ));
+    project.settings.gif.output_width = Some(preview_width);
+    project.settings.gif.output_height = Some(preview_height);
 }
 
 fn rendered_playback_cache_key(project: &Project) -> String {
@@ -4361,6 +4631,7 @@ fn timeline_state_from_project(
 
     TimelineViewState {
         media_duration_seconds,
+        frame_fps: Some(project_frame_fps(project)),
         playhead_seconds: playhead_seconds.clamp(0.0, media_duration_seconds),
         clip_range: clip.range,
         overlays,
@@ -4381,21 +4652,45 @@ fn draw_caption_overlay(
     let stroke_width = scaled_text.stroke_width.max(0.0);
 
     let _ = cr.save();
-    cr.move_to(x, y);
-    pangocairo::functions::layout_path(cr, &layout);
-
     if stroke_width > 0.0 {
         set_cairo_source_rgba(cr, scaled_text.stroke_color);
-        cr.set_line_join(cairo::LineJoin::Round);
+        cr.set_line_join(cairo::LineJoin::Miter);
+        cr.set_line_cap(cairo::LineCap::Square);
         cr.set_line_width(stroke_width * 2.0);
-        let _ = cr.stroke_preserve();
+        for (dx, dy) in square_stroke_offsets(stroke_width) {
+            cr.new_path();
+            cr.move_to(x + dx, y + dy);
+            pangocairo::functions::layout_path(cr, &layout);
+            let _ = cr.fill();
+        }
     }
 
     set_cairo_source_rgba(cr, scaled_text.text_color);
+    cr.new_path();
+    cr.move_to(x, y);
+    pangocairo::functions::layout_path(cr, &layout);
     let _ = cr.fill();
     let _ = cr.restore();
 
     bounds
+}
+
+fn square_stroke_offsets(stroke_width: f64) -> Vec<(f64, f64)> {
+    let radius = stroke_width.round().max(0.0) as i32;
+    if radius <= 0 {
+        return Vec::new();
+    }
+
+    let mut offsets = Vec::new();
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            offsets.push((f64::from(dx), f64::from(dy)));
+        }
+    }
+    offsets
 }
 
 fn draw_caption_overlay_in_rect(
