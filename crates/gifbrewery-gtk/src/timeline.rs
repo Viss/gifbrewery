@@ -23,6 +23,7 @@ pub struct TimelineView {
 #[derive(Debug, Clone)]
 pub struct TimelineViewState {
     pub media_duration_seconds: f64,
+    pub frame_fps: Option<f64>,
     pub playhead_seconds: f64,
     pub clip_range: TimelineRange,
     pub overlays: Vec<TimelineOverlayRange>,
@@ -94,6 +95,7 @@ impl Default for TimelineViewState {
     fn default() -> Self {
         Self {
             media_duration_seconds: 3.0,
+            frame_fps: Some(12.0),
             playhead_seconds: 0.0,
             clip_range: TimelineRange {
                 start_seconds: 0.0,
@@ -144,7 +146,8 @@ impl TimelineView {
                     ));
                     match hit {
                         TimelineHit::Empty | TimelineHit::Playhead => {
-                            let seconds = x_to_seconds(x, &state, width);
+                            let seconds =
+                                snap_seconds_to_frame(x_to_seconds(x, &state, width), &state);
                             crate::diagnostics::log_line(format_args!(
                                 "timeline seek from click: seconds={seconds:.3}"
                             ));
@@ -218,75 +221,92 @@ impl TimelineView {
 
                     match hit {
                         TimelineHit::Playhead => {
-                            state.playhead_seconds = clamp_seconds(
+                            state.playhead_seconds = snap_seconds_to_frame(
                                 origin.playhead_seconds + seconds_delta,
-                                0.0,
-                                state.media_duration_seconds,
+                                &state,
                             );
                             seek = Some(state.playhead_seconds);
                         }
                         TimelineHit::ClipStart => {
-                            state.clip_range.start_seconds = clamp_seconds(
-                                origin.clip_range.start_seconds + seconds_delta,
-                                0.0,
-                                origin.clip_range.end_seconds - MIN_DURATION,
-                            );
+                            let gap = min_frame_gap_seconds(&state);
+                            let max_start = (origin.clip_range.end_seconds - gap).max(0.0);
+                            state.clip_range.start_seconds =
+                                snap_seconds_to_frame_in_range(
+                                    origin.clip_range.start_seconds + seconds_delta,
+                                    0.0,
+                                    max_start,
+                                    &state,
+                                );
                             clamp_overlay_to_clip(&mut state);
                             clip_changed = Some(state.clip_range);
                         }
                         TimelineHit::ClipEnd => {
-                            state.clip_range.end_seconds = clamp_seconds(
-                                origin.clip_range.end_seconds + seconds_delta,
-                                origin.clip_range.start_seconds + MIN_DURATION,
-                                state.media_duration_seconds,
-                            );
+                            let gap = min_frame_gap_seconds(&state);
+                            let min_end = origin.clip_range.start_seconds + gap;
+                            state.clip_range.end_seconds =
+                                snap_seconds_to_frame_in_range(
+                                    origin.clip_range.end_seconds + seconds_delta,
+                                    min_end,
+                                    state.media_duration_seconds,
+                                    &state,
+                                );
                             clamp_overlay_to_clip(&mut state);
                             clip_changed = Some(state.clip_range);
                         }
                         TimelineHit::OverlayStart => {
                             let clip_range = state.clip_range;
+                            let gap = min_frame_gap_seconds(&state);
+                            let frame_fps = state.frame_fps;
                             if let (Some(origin_range), Some(index)) =
                                 (origin.overlay_range, origin.overlay_index)
                             {
                                 if let Some(overlay) = state.overlays.get_mut(index)
                                 {
-                                    overlay.range.start_seconds = clamp_seconds(
-                                        origin_range.start_seconds + seconds_delta,
-                                        clip_range.start_seconds,
-                                        overlay.range.end_seconds - MIN_DURATION,
-                                    );
+                                    overlay.range.start_seconds =
+                                        snap_seconds_to_frame_in_range_with_fps(
+                                            origin_range.start_seconds + seconds_delta,
+                                            clip_range.start_seconds,
+                                            overlay.range.end_seconds - gap,
+                                            frame_fps,
+                                        );
                                     overlay_changed = Some((overlay.id.clone(), overlay.range));
                                 }
                             }
                         }
                         TimelineHit::OverlayEnd => {
                             let clip_range = state.clip_range;
+                            let gap = min_frame_gap_seconds(&state);
+                            let frame_fps = state.frame_fps;
                             if let (Some(origin_range), Some(index)) =
                                 (origin.overlay_range, origin.overlay_index)
                             {
                                 if let Some(overlay) = state.overlays.get_mut(index)
                                 {
-                                    overlay.range.end_seconds = clamp_seconds(
-                                        origin_range.end_seconds + seconds_delta,
-                                        overlay.range.start_seconds + MIN_DURATION,
-                                        clip_range.end_seconds,
-                                    );
+                                    overlay.range.end_seconds =
+                                        snap_seconds_to_frame_in_range_with_fps(
+                                            origin_range.end_seconds + seconds_delta,
+                                            overlay.range.start_seconds + gap,
+                                            clip_range.end_seconds,
+                                            frame_fps,
+                                        );
                                     overlay_changed = Some((overlay.id.clone(), overlay.range));
                                 }
                             }
                         }
                         TimelineHit::OverlayBody => {
                             let clip_range = state.clip_range;
+                            let frame_fps = state.frame_fps;
                             if let (Some(origin_range), Some(index)) =
                                 (origin.overlay_range, origin.overlay_index)
                             {
                                 if let Some(overlay) = state.overlays.get_mut(index)
                                 {
                                     let duration = origin_range.duration_seconds();
-                                    let start_seconds = clamp_seconds(
+                                    let start_seconds = snap_seconds_to_frame_in_range_with_fps(
                                         origin_range.start_seconds + seconds_delta,
                                         clip_range.start_seconds,
                                         clip_range.end_seconds - duration,
+                                        frame_fps,
                                     );
                                     overlay.range = TimelineRange {
                                         start_seconds,
@@ -845,6 +865,42 @@ fn pixels_to_seconds(pixels: f64, state: &TimelineViewState, width: f64) -> f64 
 
 fn clamp_seconds(value: f64, min: f64, max: f64) -> f64 {
     value.clamp(min, max.max(min))
+}
+
+fn snap_seconds_to_frame(seconds: f64, state: &TimelineViewState) -> f64 {
+    snap_seconds_to_frame_in_range(seconds, 0.0, state.media_duration_seconds, state)
+}
+
+fn snap_seconds_to_frame_in_range(
+    seconds: f64,
+    min: f64,
+    max: f64,
+    state: &TimelineViewState,
+) -> f64 {
+    snap_seconds_to_frame_in_range_with_fps(seconds, min, max, state.frame_fps)
+}
+
+fn snap_seconds_to_frame_in_range_with_fps(
+    seconds: f64,
+    min: f64,
+    max: f64,
+    frame_fps: Option<f64>,
+) -> f64 {
+    let clamped = clamp_seconds(seconds, min, max);
+    let Some(fps) = frame_fps.filter(|fps| *fps > 0.0) else {
+        return clamped;
+    };
+    let snapped = (clamped * fps).round() / fps;
+    clamp_seconds(snapped, min, max)
+}
+
+fn min_frame_gap_seconds(state: &TimelineViewState) -> f64 {
+    state
+        .frame_fps
+        .filter(|fps| *fps > 0.0)
+        .map(|fps| 1.0 / fps)
+        .unwrap_or(MIN_DURATION)
+        .max(MIN_DURATION)
 }
 
 fn format_time(seconds: f64) -> String {
