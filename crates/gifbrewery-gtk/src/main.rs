@@ -322,10 +322,17 @@ fn layout_smoke_project(source_path: String) -> Project {
 
 fn compare_preview_smoke_project(source_path: String) -> Project {
     let mut project = smoke_project(source_path);
+    let smoke_end_seconds = project
+        .source
+        .as_ref()
+        .and_then(|source| source.duration_seconds)
+        .filter(|duration| *duration > 0.0)
+        .map(|duration| duration.min(2.0))
+        .unwrap_or(2.0);
     if let Some(clip) = project.clips.first_mut() {
         clip.range = TimelineRange {
             start_seconds: 0.0,
-            end_seconds: 2.0,
+            end_seconds: smoke_end_seconds,
         };
         clip.crop = Some(CropRect {
             left: 0.12,
@@ -342,7 +349,7 @@ fn compare_preview_smoke_project(source_path: String) -> Project {
     first.text = "Preview = Export".to_string();
     first.range = TimelineRange {
         start_seconds: 0.0,
-        end_seconds: 1.25,
+        end_seconds: smoke_end_seconds.min(1.25),
     };
     first.bounds = Rect {
         x: 0.08,
@@ -359,8 +366,8 @@ fn compare_preview_smoke_project(source_path: String) -> Project {
     second.id = "caption-compare-2".to_string();
     second.text = "Second overlay".to_string();
     second.range = TimelineRange {
-        start_seconds: 0.5,
-        end_seconds: 2.0,
+        start_seconds: smoke_end_seconds.min(0.5),
+        end_seconds: smoke_end_seconds,
     };
     second.bounds = Rect {
         x: 0.14,
@@ -443,9 +450,9 @@ fn run_crop_playback_smoke(project: &Project, out_dir: &Path) -> Result<(), Stri
     let frame_count = sequence.frames.len();
     let generated_fps = frame_count as f64 / render_seconds.max(0.001);
     let frame_budget_ms = 1000.0 / f64::from(sequence.fps.max(1));
-    let first_frame = out_dir.join("crop-playback-first-frame.png");
-    let middle_frame = out_dir.join("crop-playback-middle-frame.png");
-    let last_frame = out_dir.join("crop-playback-last-frame.png");
+    let first_frame = out_dir.join("crop-playback-first-frame.jpg");
+    let middle_frame = out_dir.join("crop-playback-middle-frame.jpg");
+    let last_frame = out_dir.join("crop-playback-last-frame.jpg");
 
     fs::copy(&sequence.frames[0], &first_frame).map_err(|err| {
         format!(

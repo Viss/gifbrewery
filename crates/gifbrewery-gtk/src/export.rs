@@ -1,6 +1,4 @@
-use gifbrewery_core::{
-    Clip, CropRect, FrameStrategy, Overlay, Project, RgbaColor, TextAlignment, TextOverlay,
-};
+use gifbrewery_core::{Clip, CropRect, Overlay, Project, RgbaColor, TextAlignment, TextOverlay};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -31,8 +29,7 @@ where
         .first()
         .ok_or_else(|| "project has no clip".to_string())?;
 
-    let duration = clip.range.duration_seconds().max(0.01);
-    let fps = export_fps(project, duration);
+    let fps = export_fps(project)?;
 
     let geometry = RenderGeometry::from_project(project, clip, 1.0);
     progress(ExportProgress {
@@ -75,8 +72,7 @@ pub fn render_frame_png(
         .source
         .as_ref()
         .ok_or_else(|| "project has no source media".to_string())?;
-    let duration = clip.range.duration_seconds().max(0.01);
-    let fps = export_fps(project, duration);
+    let fps = export_fps(project)?;
     let mut frame_clip = clip.clone();
     frame_clip.range.start_seconds = playhead_seconds.max(0.0);
     frame_clip.range.end_seconds = frame_clip.range.start_seconds + (1.0 / f64::from(fps));
@@ -127,7 +123,7 @@ pub fn render_frame_sequence(
         .as_ref()
         .ok_or_else(|| "project has no source media".to_string())?;
     let duration = clip.range.duration_seconds().max(0.01);
-    let fps = export_fps(project, duration);
+    let fps = export_fps(project)?;
     let geometry = RenderGeometry::from_project(project, clip, 1.0);
     let text_dir = drawtext_temp_dir()?;
     let video_filter = video_filter(project, clip, Some(fps), geometry, &text_dir)?;
@@ -336,30 +332,17 @@ fn drawtext_temp_dir() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn export_fps(project: &Project, duration: f64) -> u32 {
-    if let Some(source_fps) = project
+fn export_fps(project: &Project) -> Result<u32, String> {
+    let source = project
         .source
         .as_ref()
-        .and_then(|source| source.fps)
-        .filter(|fps| *fps > 0.0)
-    {
-        return source_fps.round().clamp(1.0, 120.0) as u32;
-    }
+        .ok_or_else(|| "project has no source media".to_string())?;
 
-    let Some(clip) = project.clips.first() else {
-        return 30;
-    };
-    match clip.frame_strategy {
-        FrameStrategy::Fps(fps) => fps.clamp(1, 120),
-        FrameStrategy::Count(count) => ((f64::from(count) / duration).round() as u32).clamp(1, 120),
-        FrameStrategy::DelayMillis(delay) => {
-            if delay == 0 {
-                30
-            } else {
-                (1000 / delay).clamp(1, 120)
-            }
-        }
-    }
+    let source_fps = source.fps.filter(|fps| *fps > 0.0).ok_or_else(|| {
+        "source media frame rate is unknown; refusing to render with a guessed fps".to_string()
+    })?;
+
+    Ok(source_fps.round().clamp(1.0, 120.0) as u32)
 }
 
 fn source_is_gif(project: &Project) -> bool {
@@ -826,7 +809,7 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gif_loop_count, RenderGeometry};
+    use super::{export_fps, gif_loop_count, RenderGeometry};
     use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
 
     fn gif_with_loop_count(count: u16) -> Vec<u8> {
@@ -879,6 +862,25 @@ mod tests {
 
         assert_eq!(geometry.output_width, 250);
         assert_eq!(geometry.output_height, 125);
+    }
+
+    #[test]
+    fn export_fps_requires_source_fps() {
+        let mut project = geometry_test_project();
+        project
+            .source
+            .as_mut()
+            .expect("test project has source")
+            .fps = None;
+        project
+            .clips
+            .first_mut()
+            .expect("default project has a clip")
+            .frame_strategy = gifbrewery_core::FrameStrategy::Fps(12);
+
+        let err = export_fps(&project).expect_err("missing source fps must not fall back");
+
+        assert!(err.contains("frame rate is unknown"));
     }
 
     fn geometry_test_project() -> Project {

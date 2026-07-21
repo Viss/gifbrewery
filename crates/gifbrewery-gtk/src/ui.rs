@@ -47,23 +47,23 @@ struct AppState {
     thumbnails: Vec<crate::timeline::TimelineThumbnail>,
     syncing_widgets: bool,
     thumbnail_generation: u64,
-    preview_render_generation: u64,
-    last_preview_render_key: Option<String>,
-    preview_render_pending: bool,
-    preview_render_rebuild_requested: bool,
     rendered_playback_cache: Option<RenderedPlaybackCache>,
     rendered_playback_generation: u64,
     rendered_playback_preparing: bool,
     rendered_playback_rebuild_requested: bool,
     rendered_playback_preload_deferred: bool,
     rendered_playback_preload_debounce: u64,
+    rendered_playback_start_requested: bool,
+    rendered_playback_frame_index: usize,
     rendered_playback_tick: Option<Instant>,
+    rendered_playback_started_at: Option<Instant>,
+    preview_loop_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
 struct RenderedPlaybackCache {
     key: String,
-    frames: Vec<PathBuf>,
+    frames: Vec<gdk::Texture>,
     fps: f64,
     frame_duration_seconds: f64,
     clip_start_seconds: f64,
@@ -82,6 +82,7 @@ struct EditorWidgets {
     restart_button: gtk::Button,
     play_button: gtk::Button,
     pause_button: gtk::Button,
+    loop_toggle: gtk::ToggleButton,
     source_title: gtk::Label,
     source_detail: gtk::Label,
     empty_state: gtk::Box,
@@ -126,6 +127,14 @@ struct PixelBounds {
 struct CaptionDragStart {
     model_bounds: Rect,
     pixel_bounds: Option<PixelBounds>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptionDragLimits {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
 }
 
 impl PixelBounds {
@@ -306,6 +315,8 @@ impl CropOverlay {
 struct InspectorWidgets {
     clip_start: adw::SpinRow,
     clip_end: adw::SpinRow,
+    clip_mark_start: gtk::Button,
+    clip_mark_end: gtk::Button,
     clip_speed: adw::SpinRow,
     clip_fps: adw::SpinRow,
     target_size_mb: adw::SpinRow,
@@ -348,17 +359,17 @@ pub fn build_main_window(app: &adw::Application) -> AppHandle {
         thumbnails: Vec::new(),
         syncing_widgets: false,
         thumbnail_generation: 0,
-        preview_render_generation: 0,
-        last_preview_render_key: None,
-        preview_render_pending: false,
-        preview_render_rebuild_requested: false,
         rendered_playback_cache: None,
         rendered_playback_generation: 0,
         rendered_playback_preparing: false,
         rendered_playback_rebuild_requested: false,
         rendered_playback_preload_deferred: false,
         rendered_playback_preload_debounce: 0,
+        rendered_playback_start_requested: false,
+        rendered_playback_frame_index: 0,
         rendered_playback_tick: None,
+        rendered_playback_started_at: None,
+        preview_loop_enabled: false,
     }));
 
     let project = state.borrow().project.clone();
@@ -580,6 +591,7 @@ fn build_editor(
             restart_button: timeline_controls.restart,
             play_button: timeline_controls.play,
             pause_button: timeline_controls.pause,
+            loop_toggle: timeline_controls.loop_toggle,
             time_label,
             timeline_view,
             crop_overlay,
@@ -593,6 +605,7 @@ struct TimelineControls {
     restart: gtk::Button,
     play: gtk::Button,
     pause: gtk::Button,
+    loop_toggle: gtk::ToggleButton,
 }
 
 fn build_timeline(project: &Project) -> (gtk::Box, TimelineControls, gtk::Label, TimelineView) {
@@ -635,6 +648,14 @@ fn build_timeline(project: &Project) -> (gtk::Box, TimelineControls, gtk::Label,
     pause_button.add_css_class("flat");
     controls.append(&pause_button);
 
+    let loop_toggle = gtk::ToggleButton::builder()
+        .icon_name("media-playlist-repeat-symbolic")
+        .tooltip_text("Loop preview")
+        .focusable(false)
+        .build();
+    loop_toggle.add_css_class("flat");
+    controls.append(&loop_toggle);
+
     let clip = project.clips.first().expect("default project has a clip");
     let time_label = gtk::Label::new(Some(&format!(
         "{:.2}s - {:.2}s",
@@ -662,6 +683,7 @@ fn build_timeline(project: &Project) -> (gtk::Box, TimelineControls, gtk::Label,
             restart: restart_button,
             play: play_button,
             pause: pause_button,
+            loop_toggle,
         },
         time_label,
         timeline_view,
@@ -701,6 +723,8 @@ fn build_inspector(project: &Project) -> (gtk::Box, InspectorWidgets) {
         InspectorWidgets {
             clip_start: clip_widgets.start,
             clip_end: clip_widgets.end,
+            clip_mark_start: clip_widgets.mark_start,
+            clip_mark_end: clip_widgets.mark_end,
             clip_speed: clip_widgets.speed,
             clip_fps: clip_widgets.fps,
             target_size_mb: gif_widgets.target_size_mb,
@@ -737,6 +761,8 @@ fn build_inspector(project: &Project) -> (gtk::Box, InspectorWidgets) {
 struct ClipInspectorWidgets {
     start: adw::SpinRow,
     end: adw::SpinRow,
+    mark_start: gtk::Button,
+    mark_end: gtk::Button,
     speed: adw::SpinRow,
     fps: adw::SpinRow,
 }
@@ -763,6 +789,18 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
         1.0,
     );
     group.add(&end);
+    let mark_start = gtk::Button::builder()
+        .label("Mark Start")
+        .tooltip_text("Set start frame to the playhead")
+        .valign(gtk::Align::Center)
+        .build();
+    group.add(&action_row_with_suffix("Start at Playhead", &mark_start));
+    let mark_end = gtk::Button::builder()
+        .label("Mark End")
+        .tooltip_text("Set end frame to the playhead")
+        .valign(gtk::Align::Center)
+        .build();
+    group.add(&action_row_with_suffix("End at Playhead", &mark_end));
     let speed = spin_row("Speed", clip.speed, 0.05, 8.0, 0.05);
     speed.set_sensitive(false);
     group.add(&speed);
@@ -786,6 +824,8 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
         ClipInspectorWidgets {
             start,
             end,
+            mark_start,
+            mark_end,
             speed,
             fps,
         },
@@ -1353,20 +1393,25 @@ fn clip_fps_value(strategy: &FrameStrategy) -> f64 {
         FrameStrategy::Fps(fps) => f64::from(*fps),
         FrameStrategy::Count(count) => f64::from(*count),
         FrameStrategy::DelayMillis(delay) if *delay > 0 => f64::from(1000 / delay),
-        FrameStrategy::DelayMillis(_) => 12.0,
+        FrameStrategy::DelayMillis(_) => 0.0,
     }
 }
 
 fn project_frame_fps(project: &Project) -> f64 {
-    source_frame_fps(project)
-        .or_else(|| {
-            project
-                .clips
-                .first()
-                .map(|clip| clip_fps_value(&clip.frame_strategy))
-        })
-        .unwrap_or(12.0)
-        .clamp(1.0, 240.0)
+    project_frame_fps_option(project).unwrap_or(1.0)
+}
+
+fn project_frame_fps_option(project: &Project) -> Option<f64> {
+    if project.source.is_some() {
+        return source_frame_fps(project).map(|fps| fps.clamp(1.0, 240.0));
+    }
+
+    project
+        .clips
+        .first()
+        .map(|clip| clip_fps_value(&clip.frame_strategy))
+        .filter(|fps| *fps > 0.0)
+        .map(|fps| fps.clamp(1.0, 240.0))
 }
 
 fn frame_duration_seconds(project: &Project) -> f64 {
@@ -1645,6 +1690,15 @@ fn install_widget_bindings(
         move |_| pause_preview_playback(&state, &widgets)
     });
 
+    widgets.editor.loop_toggle.connect_toggled({
+        let state = Rc::clone(state);
+        move |button| {
+            let enabled = button.is_active();
+            state.borrow_mut().preview_loop_enabled = enabled;
+            crate::diagnostics::log_line(format_args!("preview loop toggled: enabled={enabled}"));
+        }
+    });
+
     widgets
         .inspector
         .clip_start
@@ -1672,6 +1726,18 @@ fn install_widget_bindings(
                 update_clip_end_frame(&state, &widgets, row.value());
             }
         });
+
+    widgets.inspector.clip_mark_start.connect_clicked({
+        let state = Rc::clone(state);
+        let widgets = widgets.clone();
+        move |_| mark_clip_start_at_playhead(&state, &widgets)
+    });
+
+    widgets.inspector.clip_mark_end.connect_clicked({
+        let state = Rc::clone(state);
+        let widgets = widgets.clone();
+        move |_| mark_clip_end_at_playhead(&state, &widgets)
+    });
 
     widgets
         .inspector
@@ -2256,20 +2322,26 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
             .and_then(|metadata| metadata.duration_seconds)
             .filter(|duration| *duration > 0.0);
 
+        let source_fps = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.fps)
+            .filter(|fps| *fps > 0.0);
+
         state.project.source = Some(MediaSource {
             path: display_path.clone(),
             duration_seconds,
             natural_width: metadata.as_ref().and_then(|metadata| metadata.width),
             natural_height: metadata.as_ref().and_then(|metadata| metadata.height),
-            fps: metadata
-                .as_ref()
-                .and_then(|metadata| metadata.fps)
-                .filter(|fps| *fps > 0.0),
+            fps: source_fps,
         });
         state.playhead_seconds = 0.0;
         state.thumbnails = Vec::new();
         state.thumbnail_generation = state.thumbnail_generation.wrapping_add(1);
         invalidate_render_outputs(&mut state);
+
+        if let (Some(clip), Some(source_fps)) = (state.project.clips.first_mut(), source_fps) {
+            clip.frame_strategy = FrameStrategy::Fps(source_fps.round().clamp(1.0, 120.0) as u32);
+        }
 
         if let Some(duration_seconds) = duration_seconds {
             let clip_end = duration_seconds.max(0.01);
@@ -2317,14 +2389,28 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
     if let Some((path, duration)) = thumbnail_source {
         start_thumbnail_worker(state, widgets, path.to_path_buf(), duration);
     }
-    if should_auto_preload_rendered_playback(&state.borrow().project) {
+    let can_render_source = source_frame_fps(&state.borrow().project).is_some();
+    if !can_render_source {
+        widgets
+            .editor
+            .source_title
+            .set_label("Source frame rate unavailable");
+        widgets.editor.export_status.set_visible(true);
+        widgets.editor.export_status.set_label("Cannot render");
+        crate::diagnostics::log_line(format_args!(
+            "rendered sequence preload skipped on source load: source fps unavailable"
+        ));
+    } else if should_auto_preload_rendered_playback(&state.borrow().project) {
         start_rendered_playback_preload(state, widgets, "source loaded");
     } else {
         crate::diagnostics::log_line(format_args!(
             "rendered sequence preload skipped on source load: estimated cache too large"
         ));
     }
-    widgets.editor.export_button.set_sensitive(true);
+    widgets
+        .editor
+        .export_button
+        .set_sensitive(can_render_source);
 }
 
 fn start_thumbnail_worker(
@@ -2376,6 +2462,26 @@ fn start_rendered_playback_preload(
         if state.project.source.is_none() {
             return;
         }
+        if source_frame_fps(&state.project).is_none() {
+            state.rendered_playback_preload_deferred = false;
+            state.rendered_playback_rebuild_requested = false;
+            state.rendered_playback_start_requested = false;
+            state.is_playing = false;
+            crate::diagnostics::log_line(format_args!(
+                "rendered sequence preload refused: source fps unavailable"
+            ));
+            drop(state);
+            widgets
+                .editor
+                .source_title
+                .set_label("Source frame rate unavailable");
+            widgets.editor.export_status.set_visible(true);
+            widgets.editor.export_status.set_label("Cannot render");
+            return;
+        }
+        state.rendered_playback_preload_deferred = false;
+        state.rendered_playback_preload_debounce =
+            state.rendered_playback_preload_debounce.wrapping_add(1);
         if state.rendered_playback_preparing {
             state.rendered_playback_rebuild_requested = true;
             crate::diagnostics::log_line(format_args!(
@@ -2453,6 +2559,7 @@ fn start_rendered_playback_preload(
             state.borrow().rendered_playback_generation == generation && current_key == cache_key;
         if !is_current {
             let should_restart = state.borrow().rendered_playback_rebuild_requested;
+            let should_start_when_ready = state.borrow().rendered_playback_start_requested;
             {
                 let mut state = state.borrow_mut();
                 state.rendered_playback_preparing = false;
@@ -2462,7 +2569,9 @@ fn start_rendered_playback_preload(
             crate::diagnostics::log_line(format_args!(
                 "rendered sequence preload discarded stale cache"
             ));
-            if should_restart {
+            if should_start_when_ready {
+                start_rendered_playback_preload(&state, &widgets, "pending playback requested");
+            } else if should_restart {
                 defer_rendered_playback_preload(&state, &widgets, "coalesced project changes");
             }
             return glib::ControlFlow::Break;
@@ -2470,6 +2579,32 @@ fn start_rendered_playback_preload(
 
         match result {
             Ok(sequence) => {
+                let frame_count = sequence.frames.len();
+                let textures = match load_rendered_playback_textures(&sequence.frames) {
+                    Ok(textures) => textures,
+                    Err(err) => {
+                        let was_requested = state.borrow().rendered_playback_start_requested;
+                        {
+                            let mut state = state.borrow_mut();
+                            state.rendered_playback_preparing = false;
+                            state.rendered_playback_rebuild_requested = false;
+                            state.rendered_playback_start_requested = false;
+                            state.rendered_playback_frame_index = 0;
+                            state.rendered_playback_cache = None;
+                        }
+                        widgets.editor.source_title.set_label(if was_requested {
+                            "Preview frames failed"
+                        } else {
+                            "Preview ready"
+                        });
+                        widgets.editor.export_status.set_visible(true);
+                        widgets.editor.export_status.set_label("Error");
+                        crate::diagnostics::log_line(format_args!(
+                            "rendered sequence preload texture decode failed: {err}"
+                        ));
+                        return glib::ControlFlow::Break;
+                    }
+                };
                 let clip_range = state
                     .borrow()
                     .project
@@ -2480,11 +2615,12 @@ fn start_rendered_playback_preload(
                         start_seconds: 0.0,
                         end_seconds: sequence.duration_seconds,
                     });
+                let should_start_when_ready = state.borrow().rendered_playback_start_requested;
                 {
                     let mut state = state.borrow_mut();
                     state.rendered_playback_cache = Some(RenderedPlaybackCache {
                         key: cache_key.clone(),
-                        frames: sequence.frames,
+                        frames: textures,
                         fps: f64::from(sequence.fps),
                         frame_duration_seconds: 1.0 / f64::from(sequence.fps.max(1)),
                         clip_start_seconds: clip_range.start_seconds,
@@ -2492,8 +2628,23 @@ fn start_rendered_playback_preload(
                     });
                     state.rendered_playback_preparing = false;
                     state.rendered_playback_rebuild_requested = false;
+                    if should_start_when_ready {
+                        state.rendered_playback_start_requested = false;
+                        state.is_playing = true;
+                        state.rendered_playback_frame_index = 0;
+                        state.playhead_seconds = clip_range.start_seconds;
+                        state.rendered_playback_tick = None;
+                        state.rendered_playback_started_at = Some(Instant::now());
+                    }
                 }
-                widgets.editor.source_title.set_label("Preview ready");
+                widgets
+                    .editor
+                    .source_title
+                    .set_label(if should_start_when_ready {
+                        "Playing preview"
+                    } else {
+                        "Preview ready"
+                    });
                 widgets.editor.export_status.set_visible(false);
                 crate::diagnostics::log_line(format_args!(
                     "rendered sequence preload ready: dir={} fps={} frames={}",
@@ -2506,16 +2657,31 @@ fn start_rendered_playback_preload(
                         .map(|cache| cache.frames.len())
                         .unwrap_or(0)
                 ));
+                crate::diagnostics::log_line(format_args!(
+                    "rendered sequence textures ready: frames={frame_count}"
+                ));
+                if should_start_when_ready {
+                    crate::diagnostics::log_line(format_args!(
+                        "rendered sequence playback auto-started after cache ready"
+                    ));
+                }
                 update_timeline_widgets(&state, &widgets);
             }
             Err(err) => {
+                let was_requested = state.borrow().rendered_playback_start_requested;
                 {
                     let mut state = state.borrow_mut();
                     state.rendered_playback_preparing = false;
                     state.rendered_playback_rebuild_requested = false;
+                    state.rendered_playback_start_requested = false;
+                    state.rendered_playback_frame_index = 0;
                     state.rendered_playback_cache = None;
                 }
-                widgets.editor.source_title.set_label("Preview ready");
+                widgets.editor.source_title.set_label(if was_requested {
+                    "Preview frames failed"
+                } else {
+                    "Preview ready"
+                });
                 widgets.editor.export_status.set_visible(false);
                 crate::diagnostics::log_line(format_args!(
                     "rendered sequence preload failed: {err}"
@@ -2525,6 +2691,17 @@ fn start_rendered_playback_preload(
 
         glib::ControlFlow::Break
     });
+}
+
+fn load_rendered_playback_textures(paths: &[PathBuf]) -> Result<Vec<gdk::Texture>, String> {
+    paths
+        .iter()
+        .map(|path| {
+            let file = gio::File::for_path(path);
+            gdk::Texture::from_file(&file)
+                .map_err(|err| format!("failed to decode {}: {err}", path.display()))
+        })
+        .collect()
 }
 
 fn export_current_gif(
@@ -2781,8 +2958,15 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
 
     let receiver = Rc::new(RefCell::new(receiver));
     glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
-        let Ok(result) = receiver.borrow_mut().try_recv() else {
-            return glib::ControlFlow::Continue;
+        let result = match receiver.borrow_mut().try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                if picture.root().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                return glib::ControlFlow::Continue;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
         };
         match result {
             Ok((frames, delay_ms)) => animate_picture_frames(picture.clone(), frames, delay_ms),
@@ -2830,14 +3014,28 @@ fn export_preview_delay_ms(output_path: &Path, frame_count: usize) -> u64 {
 }
 
 fn animate_picture_frames(picture: gtk::Picture, frames: Vec<PathBuf>, delay_ms: u64) {
-    let frames = Rc::new(frames);
+    let frames = match load_rendered_playback_textures(&frames) {
+        Ok(frames) => Rc::new(frames),
+        Err(err) => {
+            crate::diagnostics::log_line(format_args!(
+                "export preview texture decode failed: {err}"
+            ));
+            return;
+        }
+    };
     let index = Rc::new(Cell::new(0usize));
     picture.set_content_fit(gtk::ContentFit::Contain);
-    picture.set_file(Some(&gio::File::for_path(&frames[0])));
+    picture.set_paintable(Some(&frames[0]));
+    if frames.len() <= 1 {
+        return;
+    }
     glib::timeout_add_local(std::time::Duration::from_millis(delay_ms), move || {
+        if picture.root().is_none() {
+            return glib::ControlFlow::Break;
+        }
         let next = (index.get() + 1) % frames.len();
         index.set(next);
-        picture.set_file(Some(&gio::File::for_path(&frames[next])));
+        picture.set_paintable(Some(&frames[next]));
         glib::ControlFlow::Continue
     });
 }
@@ -2856,6 +3054,8 @@ fn restart_preview_at_clip_start(state: &Rc<RefCell<AppState>>, widgets: &AppWid
     let start_seconds = {
         let mut state = state.borrow_mut();
         state.is_playing = false;
+        state.rendered_playback_start_requested = false;
+        state.rendered_playback_frame_index = 0;
         let start_seconds = state
             .project
             .clips
@@ -2880,6 +3080,20 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
     let (cache_ready, start_seconds, preparing) = {
         let mut state = state.borrow_mut();
         if state.project.source.is_none() {
+            return;
+        }
+        if source_frame_fps(&state.project).is_none() {
+            state.rendered_playback_start_requested = false;
+            state.is_playing = false;
+            widgets
+                .editor
+                .source_title
+                .set_label("Source frame rate unavailable");
+            widgets.editor.export_status.set_visible(true);
+            widgets.editor.export_status.set_label("Cannot render");
+            crate::diagnostics::log_line(format_args!(
+                "rendered sequence playback refused: source fps unavailable"
+            ));
             return;
         }
         let clip_range = state
@@ -2911,8 +3125,19 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
     if cache_ready {
         {
             let mut state = state.borrow_mut();
+            state.rendered_playback_start_requested = false;
             state.is_playing = true;
-            state.rendered_playback_tick = Some(Instant::now());
+            let frame_index = state
+                .rendered_playback_cache
+                .as_ref()
+                .map(|cache| {
+                    ((state.playhead_seconds - cache.clip_start_seconds).max(0.0) * cache.fps)
+                        .floor() as usize
+                })
+                .unwrap_or(0);
+            state.rendered_playback_frame_index = frame_index;
+            state.rendered_playback_tick = None;
+            state.rendered_playback_started_at = Some(Instant::now());
         }
         crate::diagnostics::log_line(format_args!(
             "rendered sequence playback start from cached frames: {start_seconds:.3}s"
@@ -2921,8 +3146,13 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
         return;
     }
 
+    {
+        let mut state = state.borrow_mut();
+        state.rendered_playback_start_requested = true;
+    }
+
     if !preparing {
-        defer_rendered_playback_preload(state, widgets, "playback requested");
+        start_rendered_playback_preload(state, widgets, "playback requested");
     }
     widgets.editor.source_title.set_label(if preparing {
         "Preview frames still loading..."
@@ -2937,16 +3167,22 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
 }
 
 fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
-    let (frame_path, reached_clip_end) = {
+    let frame_texture = {
         let mut state = state.borrow_mut();
         let Some(cache) = state.rendered_playback_cache.clone() else {
             state.is_playing = false;
+            state.rendered_playback_start_requested = false;
+            state.rendered_playback_frame_index = 0;
             state.rendered_playback_tick = None;
+            state.rendered_playback_started_at = None;
             return;
         };
         if cache.key != rendered_playback_cache_key(&playback_preload_project(&state.project)) {
             state.is_playing = false;
+            state.rendered_playback_start_requested = false;
+            state.rendered_playback_frame_index = 0;
             state.rendered_playback_tick = None;
+            state.rendered_playback_started_at = None;
             state.rendered_playback_cache = None;
             crate::diagnostics::log_line(format_args!(
                 "rendered sequence playback stopped because project changed"
@@ -2955,44 +3191,72 @@ fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWi
         }
         if cache.frames.is_empty() {
             state.is_playing = false;
+            state.rendered_playback_start_requested = false;
+            state.rendered_playback_frame_index = 0;
             state.rendered_playback_tick = None;
+            state.rendered_playback_started_at = None;
             return;
         }
 
         let now = Instant::now();
-        let elapsed = state
+        if state.rendered_playback_frame_index >= cache.frames.len() {
+            let elapsed_wall = state
+                .rendered_playback_started_at
+                .map(|started| now.saturating_duration_since(started).as_secs_f64())
+                .unwrap_or(0.0);
+            if state.preview_loop_enabled {
+                state.rendered_playback_frame_index = 0;
+                state.rendered_playback_tick = None;
+                state.rendered_playback_started_at = Some(now);
+                state.playhead_seconds = cache.clip_start_seconds;
+                crate::diagnostics::log_line(format_args!(
+                    "rendered sequence playback loop restart: frames={} expected={:.3}s actual={elapsed_wall:.3}s fps={:.3}",
+                    cache.frames.len(),
+                    cache.clip_end_seconds - cache.clip_start_seconds,
+                    cache.fps
+                ));
+            } else {
+                state.is_playing = false;
+                state.rendered_playback_start_requested = false;
+                state.rendered_playback_frame_index = 0;
+                state.rendered_playback_tick = None;
+                state.rendered_playback_started_at = None;
+                state.playhead_seconds = cache.clip_start_seconds;
+                crate::diagnostics::log_line(format_args!(
+                    "rendered sequence playback reached clip end: frames={} expected={:.3}s actual={elapsed_wall:.3}s fps={:.3}",
+                    cache.frames.len(),
+                    cache.clip_end_seconds - cache.clip_start_seconds,
+                    cache.fps
+                ));
+                return;
+            }
+        }
+        if state
             .rendered_playback_tick
-            .replace(now)
-            .map(|previous| now.saturating_duration_since(previous).as_secs_f64())
-            .unwrap_or(cache.frame_duration_seconds);
-        let clip_range = state
-            .project
-            .clips
-            .first()
-            .map(|clip| clip.range)
-            .unwrap_or(TimelineRange {
-                start_seconds: cache.clip_start_seconds,
-                end_seconds: cache.clip_end_seconds,
-            });
-        let next = state.playhead_seconds + elapsed;
-        let reached_clip_end = next >= clip_range.end_seconds;
-        state.playhead_seconds = if reached_clip_end {
-            state.is_playing = false;
-            state.rendered_playback_tick = None;
-            clip_range.start_seconds
-        } else {
-            next
-        };
-        let frame_index = ((state.playhead_seconds - cache.clip_start_seconds).max(0.0) * cache.fps)
-            .floor() as usize;
-        let frame_index = frame_index.min(cache.frames.len().saturating_sub(1));
-        (cache.frames[frame_index].clone(), reached_clip_end)
+            .is_some_and(|next_due| now < next_due)
+        {
+            return;
+        }
+        let next_due = state.rendered_playback_tick.unwrap_or(now);
+        state.rendered_playback_tick = Some(next_playback_frame_due(
+            now,
+            next_due,
+            cache.frame_duration_seconds,
+        ));
+        let frame_index = state
+            .rendered_playback_frame_index
+            .min(cache.frames.len().saturating_sub(1));
+        let frame_texture = cache.frames[frame_index].clone();
+        state.playhead_seconds = cache.clip_start_seconds
+            + (frame_index as f64 / cache.fps.max(1.0)).min(cache.clip_end_seconds);
+        state.rendered_playback_frame_index = frame_index.saturating_add(1);
+        frame_texture
     };
 
     widgets
         .editor
         .rendered_frame
-        .set_file(Some(&gio::File::for_path(frame_path)));
+        .set_paintable(Some(&frame_texture));
     widgets.editor.rendered_frame.set_visible(true);
     if let Some(crop_overlay) = &widgets.editor.crop_overlay {
         crop_overlay.set_crop(None, false);
@@ -3000,24 +3264,42 @@ fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWi
     if let Some(caption) = &widgets.editor.caption_overlay {
         caption.set_exact_preview_visible(true);
     }
-    if reached_clip_end {
-        crate::diagnostics::log_line(format_args!("rendered sequence playback reached clip end"));
-    }
-    update_timeline_widgets(state, widgets);
+    update_playback_position_widgets(state, widgets);
 }
 
 fn pause_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
     {
         let mut state = state.borrow_mut();
         state.is_playing = false;
+        state.rendered_playback_start_requested = false;
+        state.rendered_playback_frame_index = 0;
         state.rendered_playback_tick = None;
+        state.rendered_playback_started_at = None;
     }
     crate::diagnostics::log_line(format_args!("preview playback pause requested"));
     update_timeline_widgets(state, widgets);
 }
 
+fn next_playback_frame_due(
+    now: Instant,
+    previous_due: Instant,
+    frame_duration_seconds: f64,
+) -> Instant {
+    let frame_duration = std::time::Duration::from_secs_f64(frame_duration_seconds.max(0.001));
+    let next_due = previous_due + frame_duration;
+    if next_due <= now {
+        now + frame_duration
+    } else {
+        next_due
+    }
+}
+
 fn toggle_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
-    if state.borrow().is_playing {
+    let should_stop = {
+        let state = state.borrow();
+        state.is_playing || state.rendered_playback_start_requested
+    };
+    if should_stop {
         pause_preview_playback(state, widgets);
     } else {
         start_preview_playback(state, widgets);
@@ -3036,6 +3318,8 @@ fn update_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, seconds:
     {
         let mut state = state.borrow_mut();
         state.is_playing = false;
+        state.rendered_playback_start_requested = false;
+        state.rendered_playback_frame_index = 0;
         let duration = project_duration_seconds(&state.project).unwrap_or_else(|| {
             state
                 .project
@@ -3051,18 +3335,9 @@ fn update_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, seconds:
 }
 
 fn step_playhead_by_frames(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, frames: i32) {
-    let (next_seconds, frame_duration, fps, next_frame) = {
+    let next_seconds = {
         let state = state.borrow();
-        let fps = source_frame_fps(&state.project).unwrap_or_else(|| {
-            state
-                .project
-                .clips
-                .first()
-                .map(|clip| clip_fps_value(&clip.frame_strategy))
-                .unwrap_or(12.0)
-        });
-        let fps = fps.clamp(1.0, 240.0);
-        let frame_duration = 1.0 / fps;
+        let fps = project_frame_fps_option(&state.project).unwrap_or(1.0);
         let duration = project_duration_seconds(&state.project).unwrap_or_else(|| {
             state
                 .project
@@ -3074,12 +3349,8 @@ fn step_playhead_by_frames(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, 
         let current_frame = (state.playhead_seconds * fps).round() as i64;
         let max_frame = (duration.max(0.01) * fps).floor().max(0.0) as i64;
         let next_frame = (current_frame + i64::from(frames)).clamp(0, max_frame);
-        let next_seconds = (next_frame as f64 / fps).clamp(0.0, duration.max(0.01));
-        (next_seconds, frame_duration, fps, next_frame)
+        (next_frame as f64 / fps).clamp(0.0, duration.max(0.01))
     };
-    crate::diagnostics::log_line(format_args!(
-        "frame step: frames={frames} fps={fps:.6} frame_duration={frame_duration:.6}s next_frame={next_frame} next={next_seconds:.6}s"
-    ));
     update_playhead(state, widgets, next_seconds);
 }
 
@@ -3121,6 +3392,28 @@ fn update_clip_end_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, en
     }
     update_timeline_widgets(state, widgets);
     defer_rendered_playback_preload(state, widgets, "clip end updated");
+}
+
+fn mark_clip_start_at_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
+    let start_frame = {
+        let state = state.borrow();
+        frame_index_for_seconds(&state.project, state.playhead_seconds) as f64
+    };
+    crate::diagnostics::log_line(format_args!(
+        "clip mark start at playhead: frame={start_frame:.0}"
+    ));
+    update_clip_start_frame(state, widgets, start_frame);
+}
+
+fn mark_clip_end_at_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
+    let end_frame = {
+        let state = state.borrow();
+        frame_index_for_seconds(&state.project, state.playhead_seconds) as f64
+    };
+    crate::diagnostics::log_line(format_args!(
+        "clip mark end at playhead: frame={end_frame:.0}"
+    ));
+    update_clip_end_frame(state, widgets, end_frame);
 }
 
 fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, _megabytes: f64) {
@@ -3807,46 +4100,69 @@ fn update_overlay_position_from_drag(
             }
         }
     };
-    let content_width = content_rect.width.max(1.0);
-    let content_height = content_rect.height.max(1.0);
-    let (min_x, max_x, min_y, max_y) = if let Some(bounds) = start.pixel_bounds {
-        let ink_left = (bounds.x - content_rect.x) / content_width;
-        let ink_right = (bounds.x + bounds.width - content_rect.x) / content_width;
-        let ink_top = (bounds.y - content_rect.y) / content_height;
-        let ink_bottom = (bounds.y + bounds.height - content_rect.y) / content_height;
-        (
-            start.model_bounds.x - ink_left,
-            1.0 - (ink_right - start.model_bounds.x),
-            start.model_bounds.y - ink_top,
-            1.0 - (ink_bottom - start.model_bounds.y),
-        )
-    } else {
-        (
-            0.0,
-            (1.0 - start.model_bounds.width).max(0.0),
-            0.0,
-            (1.0 - start.model_bounds.height).max(0.0),
-        )
-    };
+    let limits = caption_drag_limits(start, content_rect);
 
     {
         let mut state = state.borrow_mut();
         let selected_id = state.selected_overlay_id.clone();
         if let Some(overlay) = selected_text_overlay_mut(&mut state.project, selected_id.as_deref())
         {
-            overlay.bounds.x =
-                (start.model_bounds.x + offset_x / content_width).clamp(min_x, max_x.max(min_x));
-            overlay.bounds.y =
-                (start.model_bounds.y + offset_y / content_height).clamp(min_y, max_y.max(min_y));
+            overlay.bounds = caption_drag_bounds(start, limits, content_rect, offset_x, offset_y);
             let bounds = overlay.bounds;
             invalidate_overlay_output(&mut state);
             crate::diagnostics::log_line(format_args!(
-                "caption drag computed: preview=({preview_width:.1}x{preview_height:.1}) content={content_rect:?} start={start:?} clamp=({min_x:.4},{max_x:.4},{min_y:.4},{max_y:.4}) new_bounds={:?}",
-                bounds
+                "caption drag computed: preview=({preview_width:.1}x{preview_height:.1}) content={content_rect:?} start={start:?} clamp=({:.4},{:.4},{:.4},{:.4}) new_bounds={bounds:?}",
+                limits.min_x,
+                limits.max_x,
+                limits.min_y,
+                limits.max_y
             ));
         }
     }
     update_timeline_widgets(state, widgets);
+}
+
+fn caption_drag_limits(start: CaptionDragStart, content_rect: PixelBounds) -> CaptionDragLimits {
+    let content_width = content_rect.width.max(1.0);
+    let content_height = content_rect.height.max(1.0);
+    if let Some(bounds) = start.pixel_bounds {
+        let ink_left = (bounds.x - content_rect.x) / content_width;
+        let ink_right = (bounds.x + bounds.width - content_rect.x) / content_width;
+        let ink_top = (bounds.y - content_rect.y) / content_height;
+        let ink_bottom = (bounds.y + bounds.height - content_rect.y) / content_height;
+        CaptionDragLimits {
+            min_x: start.model_bounds.x - ink_left,
+            max_x: 1.0 - (ink_right - start.model_bounds.x),
+            min_y: start.model_bounds.y - ink_top,
+            max_y: 1.0 - (ink_bottom - start.model_bounds.y),
+        }
+    } else {
+        CaptionDragLimits {
+            min_x: 0.0,
+            max_x: (1.0 - start.model_bounds.width).max(0.0),
+            min_y: 0.0,
+            max_y: (1.0 - start.model_bounds.height).max(0.0),
+        }
+    }
+}
+
+fn caption_drag_bounds(
+    start: CaptionDragStart,
+    limits: CaptionDragLimits,
+    content_rect: PixelBounds,
+    offset_x: f64,
+    offset_y: f64,
+) -> Rect {
+    let content_width = content_rect.width.max(1.0);
+    let content_height = content_rect.height.max(1.0);
+    Rect {
+        x: (start.model_bounds.x + offset_x / content_width)
+            .clamp(limits.min_x, limits.max_x.max(limits.min_x)),
+        y: (start.model_bounds.y + offset_y / content_height)
+            .clamp(limits.min_y, limits.max_y.max(limits.min_y)),
+        width: start.model_bounds.width,
+        height: start.model_bounds.height,
+    }
 }
 
 fn update_overlay_shadow(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, enabled: bool) {
@@ -4218,9 +4534,47 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
     refresh_exact_preview_frame(state, widgets);
 }
 
+fn update_playback_position_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
+    let (
+        timeline_state,
+        text_overlays,
+        selected_overlay_id,
+        playhead_seconds,
+        reference_height,
+        aspect,
+    ) = {
+        let state = state.borrow();
+        let selected_overlay_id = state.selected_overlay_id.clone();
+        (
+            timeline_state_from_project(
+                &state.project,
+                selected_overlay_id.as_deref(),
+                state.playhead_seconds,
+                state.thumbnails.clone(),
+            ),
+            text_overlays_from_project(&state.project),
+            selected_overlay_id,
+            state.playhead_seconds,
+            preview_text_reference_height(&state.project),
+            rendered_preview_aspect(&state.project),
+        )
+    };
+
+    widgets.editor.timeline_view.set_state(timeline_state);
+    if let Some(caption) = &widgets.editor.caption_overlay {
+        caption.set_source_height(reference_height);
+        caption.set_exact_preview_aspect(aspect);
+        caption.set_texts_for_playhead(text_overlays, selected_overlay_id, playhead_seconds);
+    }
+}
+
 fn refresh_exact_preview_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
-    let (project, playhead_seconds, generation, should_render) = {
-        let mut state = state.borrow_mut();
+    if display_cached_rendered_frame_for_playhead(state, widgets) {
+        return;
+    }
+
+    {
+        let state = state.borrow();
         let uses_rendered_preview = uses_rendered_output_preview(&state.project);
         if state.is_playing && uses_rendered_preview {
             if let Some(crop_overlay) = &widgets.editor.crop_overlay {
@@ -4232,9 +4586,6 @@ fn refresh_exact_preview_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidge
             return;
         }
         if state.project.source.is_none() || (state.is_playing && !uses_rendered_preview) {
-            state.preview_render_generation = state.preview_render_generation.wrapping_add(1);
-            state.last_preview_render_key = None;
-            state.preview_render_pending = false;
             widgets.editor.rendered_frame.set_visible(false);
             if let Some(caption) = &widgets.editor.caption_overlay {
                 caption.set_exact_preview_visible(false);
@@ -4245,132 +4596,78 @@ fn refresh_exact_preview_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidge
             return;
         }
 
-        let key = preview_render_key(&state.project, state.playhead_seconds);
-        if state.last_preview_render_key.as_deref() == Some(key.as_str()) {
-            return;
-        }
-        if state.preview_render_pending {
-            state.preview_render_rebuild_requested = true;
-            return;
-        }
-        state.last_preview_render_key = Some(key);
-        state.preview_render_generation = state.preview_render_generation.wrapping_add(1);
-        state.preview_render_pending = true;
-        state.preview_render_rebuild_requested = false;
         if let Some(crop_overlay) = &widgets.editor.crop_overlay {
-            crop_overlay.set_crop(None, false);
-        }
-        (
-            base_preview_project(&state.project),
-            state.playhead_seconds,
-            state.preview_render_generation,
-            true,
-        )
-    };
-
-    if !should_render {
-        return;
-    }
-
-    let key = preview_render_key(&project, playhead_seconds);
-    let output_path = rendered_preview_cache_path(&key);
-    if output_path.exists() {
-        let mut state = state.borrow_mut();
-        state.preview_render_pending = false;
-        state.preview_render_rebuild_requested = false;
-        widgets
-            .editor
-            .rendered_frame
-            .set_file(Some(&gio::File::for_path(&output_path)));
-        widgets.editor.rendered_frame.set_visible(true);
-        if let Some(crop_overlay) = &widgets.editor.crop_overlay {
-            crop_overlay.set_crop(None, false);
+            let crop = state.project.clips.first().and_then(|clip| clip.crop);
+            crop_overlay.set_crop(crop, true);
         }
         if let Some(caption) = &widgets.editor.caption_overlay {
-            caption.set_exact_preview_visible(true);
+            caption.set_exact_preview_visible(false);
         }
-        return;
+        widgets.editor.rendered_frame.set_visible(false);
+
+        if state.rendered_playback_preparing || state.rendered_playback_preload_deferred {
+            widgets
+                .editor
+                .source_title
+                .set_label("Loading preview frames...");
+            widgets.editor.export_status.set_visible(true);
+            widgets
+                .editor
+                .export_status
+                .set_label("Preparing frame cache");
+        } else {
+            widgets
+                .editor
+                .source_title
+                .set_label("Preview frames unavailable");
+            widgets.editor.export_status.set_visible(true);
+            widgets.editor.export_status.set_label("Frame cache needed");
+        }
     }
-
-    let (sender, receiver) = mpsc::channel::<(u64, PathBuf, Result<(), String>)>();
-    thread::spawn({
-        let output_path = output_path.clone();
-        move || {
-            let result = crate::export::render_frame_png(&project, playhead_seconds, &output_path);
-            let _ = sender.send((generation, output_path, result));
-        }
-    });
-
-    let receiver = Rc::new(RefCell::new(receiver));
-    let state = Rc::clone(state);
-    let widgets = widgets.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
-        let Ok((generation, path, result)) = receiver.borrow_mut().try_recv() else {
-            return glib::ControlFlow::Continue;
-        };
-
-        if state.borrow().preview_render_generation != generation {
-            let should_restart = state.borrow().preview_render_rebuild_requested;
-            {
-                let mut state = state.borrow_mut();
-                state.preview_render_pending = false;
-                state.preview_render_rebuild_requested = false;
-            }
-            let _ = std::fs::remove_file(path);
-            if should_restart {
-                refresh_exact_preview_frame(&state, &widgets);
-            }
-            return glib::ControlFlow::Break;
-        }
-
-        {
-            let mut state = state.borrow_mut();
-            state.preview_render_pending = false;
-            state.preview_render_rebuild_requested = false;
-        }
-        match result {
-            Ok(()) => {
-                widgets
-                    .editor
-                    .rendered_frame
-                    .set_file(Some(&gio::File::for_path(&path)));
-                widgets.editor.rendered_frame.set_visible(true);
-                if let Some(crop_overlay) = &widgets.editor.crop_overlay {
-                    crop_overlay.set_crop(None, false);
-                }
-                if let Some(caption) = &widgets.editor.caption_overlay {
-                    caption.set_exact_preview_visible(true);
-                }
-            }
-            Err(err) => {
-                crate::diagnostics::log_line(format_args!(
-                    "exact preview render failed at {playhead_seconds:.3}s: {err}"
-                ));
-                widgets.editor.rendered_frame.set_visible(false);
-                if let Some(crop_overlay) = &widgets.editor.crop_overlay {
-                    let state = state.borrow();
-                    let crop = state.project.clips.first().and_then(|clip| clip.crop);
-                    crop_overlay.set_crop(crop, state.project.source.is_some());
-                }
-                if let Some(caption) = &widgets.editor.caption_overlay {
-                    caption.set_exact_preview_visible(false);
-                }
-            }
-        }
-
-        glib::ControlFlow::Break
-    });
 }
 
-fn rendered_preview_cache_path(key: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    let dir = std::env::temp_dir().join(format!(
-        "gifbrewery-rendered-preview-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{:016x}.png", hasher.finish()))
+fn display_cached_rendered_frame_for_playhead(
+    state: &Rc<RefCell<AppState>>,
+    widgets: &AppWidgets,
+) -> bool {
+    let frame_texture = {
+        let state = state.borrow();
+        if state.is_playing || state.project.source.is_none() {
+            return false;
+        }
+        let cache_key = rendered_playback_cache_key(&playback_preload_project(&state.project));
+        let Some(cache) = state.rendered_playback_cache.as_ref() else {
+            return false;
+        };
+        if cache.key != cache_key || cache.frames.is_empty() {
+            return false;
+        }
+        if state.playhead_seconds < cache.clip_start_seconds
+            || state.playhead_seconds > cache.clip_end_seconds
+        {
+            return false;
+        }
+
+        let frame_index = ((state.playhead_seconds - cache.clip_start_seconds).max(0.0)
+            * cache.fps.max(1.0))
+        .round() as usize;
+        let frame_texture =
+            cache.frames[frame_index.min(cache.frames.len().saturating_sub(1))].clone();
+        frame_texture
+    };
+
+    widgets
+        .editor
+        .rendered_frame
+        .set_paintable(Some(&frame_texture));
+    widgets.editor.rendered_frame.set_visible(true);
+    if let Some(crop_overlay) = &widgets.editor.crop_overlay {
+        crop_overlay.set_crop(None, false);
+    }
+    if let Some(caption) = &widgets.editor.caption_overlay {
+        caption.set_exact_preview_visible(true);
+    }
+    true
 }
 
 fn invalidate_render_outputs(state: &mut AppState) {
@@ -4379,6 +4676,8 @@ fn invalidate_render_outputs(state: &mut AppState) {
     state.rendered_playback_generation = state.rendered_playback_generation.wrapping_add(1);
     state.rendered_playback_preload_deferred = false;
     state.rendered_playback_rebuild_requested = true;
+    state.rendered_playback_start_requested = false;
+    state.rendered_playback_frame_index = 0;
     if !state.rendered_playback_preparing {
         state.rendered_playback_rebuild_requested = false;
     }
@@ -4396,6 +4695,8 @@ fn defer_rendered_playback_preload(
         state.rendered_playback_generation = state.rendered_playback_generation.wrapping_add(1);
         state.rendered_playback_preload_deferred = true;
         state.rendered_playback_rebuild_requested = false;
+        state.rendered_playback_start_requested = false;
+        state.rendered_playback_frame_index = 0;
         state.rendered_playback_tick = None;
         state.rendered_playback_preload_debounce =
             state.rendered_playback_preload_debounce.wrapping_add(1);
@@ -4423,15 +4724,7 @@ fn defer_rendered_playback_preload(
     );
 }
 
-fn invalidate_exact_preview_output(state: &mut AppState) {
-    state.preview_render_generation = state.preview_render_generation.wrapping_add(1);
-    state.last_preview_render_key = None;
-    if state.preview_render_pending {
-        state.preview_render_rebuild_requested = true;
-    } else {
-        state.preview_render_rebuild_requested = false;
-    }
-}
+fn invalidate_exact_preview_output(_state: &mut AppState) {}
 
 fn invalidate_overlay_output(_state: &mut AppState) {
     // Captions are live GTK overlays. Touching, moving, adding, or styling them
@@ -4473,6 +4766,12 @@ fn playback_preload_project(project: &Project) -> Project {
 
 fn should_auto_preload_rendered_playback(project: &Project) -> bool {
     let project = playback_preload_project(project);
+    let Some(fps) = source_frame_fps(&project) else {
+        crate::diagnostics::log_line(format_args!(
+            "rendered sequence preload auto-skip: source fps unavailable"
+        ));
+        return false;
+    };
     let Some((width, height)) = effective_output_dimensions(&project) else {
         return false;
     };
@@ -4480,9 +4779,7 @@ fn should_auto_preload_rendered_playback(project: &Project) -> bool {
         return false;
     };
     let duration = clip.range.duration_seconds().max(0.01);
-    let fps = source_frame_fps(&project)
-        .unwrap_or_else(|| clip_fps_value(&clip.frame_strategy))
-        .clamp(1.0, 120.0);
+    let fps = fps.clamp(1.0, 120.0);
     let estimated_frame_pixels =
         u64::from(width) * u64::from(height) * (duration * fps).ceil().max(1.0) as u64;
     if estimated_frame_pixels > MAX_AUTO_PRELOAD_FRAME_PIXELS {
@@ -4516,10 +4813,6 @@ fn apply_interactive_preview_size_cap(project: &mut Project) {
     let scale = f64::from(MAX_INTERACTIVE_PREVIEW_EDGE) / f64::from(max_edge);
     let preview_width = (f64::from(width) * scale).round().max(1.0) as u32;
     let preview_height = (f64::from(height) * scale).round().max(1.0) as u32;
-    crate::diagnostics::log_line(format_args!(
-        "interactive preview size capped: source_output={}x{} preview={}x{}",
-        width, height, preview_width, preview_height
-    ));
     project.settings.gif.output_width = Some(preview_width);
     project.settings.gif.output_height = Some(preview_height);
 }
@@ -4548,29 +4841,6 @@ fn rendered_playback_cache_key(project: &Project) -> String {
         project.settings.gif.colors,
         project.settings.gif.high_quality_quantization,
         project.settings.gif.optimize
-    ));
-    key
-}
-
-fn preview_render_key(project: &Project, playhead_seconds: f64) -> String {
-    let mut key = format!("{playhead_seconds:.6};");
-    if let Some(source) = &project.source {
-        key.push_str(&source.path);
-        key.push(';');
-        key.push_str(&format!(
-            "{:?}:{:?}:{:?};",
-            source.natural_width, source.natural_height, source.fps
-        ));
-    }
-    if let Some(clip) = project.clips.first() {
-        key.push_str(&format!(
-            "{:.6}:{:.6}:{:?};",
-            clip.range.start_seconds, clip.range.end_seconds, clip.crop
-        ));
-    }
-    key.push_str(&format!(
-        "{:?}:{:?};",
-        project.settings.gif.output_width, project.settings.gif.output_height
     ));
     key
 }
@@ -4672,7 +4942,7 @@ fn timeline_state_from_project(
 
     TimelineViewState {
         media_duration_seconds,
-        frame_fps: Some(project_frame_fps(project)),
+        frame_fps: project_frame_fps_option(project),
         playhead_seconds: playhead_seconds.clamp(0.0, media_duration_seconds),
         clip_range: clip.range,
         overlays,
@@ -4908,4 +5178,105 @@ fn compact_path(path: &str) -> String {
     };
 
     format!("{}/{}", parent.display(), file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "actual={actual} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn caption_drag_limits_are_stable_when_dragging_past_left_edge() {
+        let start = CaptionDragStart {
+            model_bounds: Rect {
+                x: 0.04,
+                y: 0.72,
+                width: 0.92,
+                height: 0.18,
+            },
+            pixel_bounds: Some(PixelBounds {
+                x: 318.4933333333333,
+                y: 411.16,
+                width: 255.0,
+                height: 52.0,
+            }),
+        };
+        let content_rect = PixelBounds {
+            x: 64.66666666666669,
+            y: 0.0,
+            width: 770.6666666666666,
+            height: 578.0,
+        };
+
+        let limits = caption_drag_limits(start, content_rect);
+        let first = caption_drag_bounds(start, limits, content_rect, -350.0, 0.0);
+        let second = caption_drag_bounds(start, limits, content_rect, -700.0, 0.0);
+
+        assert_close(first.x, limits.min_x);
+        assert_close(second.x, limits.min_x);
+        assert_close(first.y, start.model_bounds.y);
+        assert_close(second.y, start.model_bounds.y);
+    }
+
+    #[test]
+    fn caption_drag_fallback_limits_keep_model_box_inside_content() {
+        let start = CaptionDragStart {
+            model_bounds: Rect {
+                x: 0.25,
+                y: 0.25,
+                width: 0.5,
+                height: 0.2,
+            },
+            pixel_bounds: None,
+        };
+        let content_rect = PixelBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 400.0,
+        };
+
+        let limits = caption_drag_limits(start, content_rect);
+        let left = caption_drag_bounds(start, limits, content_rect, -10_000.0, 0.0);
+        let right = caption_drag_bounds(start, limits, content_rect, 10_000.0, 0.0);
+
+        assert_close(left.x, 0.0);
+        assert_close(right.x, 0.5);
+        assert_close(left.width, start.model_bounds.width);
+        assert_close(right.height, start.model_bounds.height);
+    }
+
+    #[test]
+    fn playback_due_advances_one_frame_interval() {
+        let start = Instant::now();
+        let frame_duration = 1.0 / 24.0;
+        let due = start + std::time::Duration::from_secs_f64(frame_duration);
+        let now = due + std::time::Duration::from_millis(1);
+        let next = next_playback_frame_due(now, due, frame_duration);
+
+        assert_close(
+            next.saturating_duration_since(due).as_secs_f64(),
+            frame_duration,
+        );
+    }
+
+    #[test]
+    fn playback_due_resets_after_large_delay() {
+        let start = Instant::now();
+        let frame_duration = 1.0 / 24.0;
+        let due = start + std::time::Duration::from_secs_f64(frame_duration);
+        let now = due + std::time::Duration::from_millis(200);
+        let next = next_playback_frame_due(now, due, frame_duration);
+
+        assert_close(
+            next.saturating_duration_since(now).as_secs_f64(),
+            frame_duration,
+        );
+    }
 }

@@ -68,7 +68,7 @@ impl Default for Clip {
                 start_seconds: 0.0,
                 end_seconds: 3.0,
             },
-            frame_strategy: FrameStrategy::Fps(12),
+            frame_strategy: FrameStrategy::Fps(0),
             speed: 1.0,
             loop_mode: ClipLoopMode::Forward,
             crop: None,

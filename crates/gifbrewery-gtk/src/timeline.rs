@@ -237,6 +237,8 @@ impl TimelineView {
                                     max_start,
                                     &state,
                                 );
+                            state.playhead_seconds = state.clip_range.start_seconds;
+                            seek = Some(state.playhead_seconds);
                             clamp_overlay_to_clip(&mut state);
                             clip_changed = Some(state.clip_range);
                         }
@@ -250,6 +252,8 @@ impl TimelineView {
                                     state.media_duration_seconds,
                                     &state,
                                 );
+                            state.playhead_seconds = state.clip_range.end_seconds;
+                            seek = Some(state.playhead_seconds);
                             clamp_overlay_to_clip(&mut state);
                             clip_changed = Some(state.clip_range);
                         }
@@ -614,8 +618,8 @@ fn draw_clip_selection(cr: &cairo::Context, width: f64, state: &TimelineViewStat
     draw_trim_handle(cr, end_x, false);
 }
 
-fn draw_trim_handle(cr: &cairo::Context, x: f64, left: bool) {
-    let handle_x = if left { x } else { x - HANDLE_WIDTH };
+fn draw_trim_handle(cr: &cairo::Context, x: f64, _left: bool) {
+    let handle_x = trim_handle_left_x(x);
     cr.set_source_rgb(0.95, 0.62, 0.18);
     rounded_rect(
         cr,
@@ -632,6 +636,10 @@ fn draw_trim_handle(cr: &cairo::Context, x: f64, left: bool) {
     cr.move_to(mark_x, FILMSTRIP_TOP + 18.0);
     cr.line_to(mark_x, FILMSTRIP_TOP + FILMSTRIP_HEIGHT - 18.0);
     let _ = cr.stroke();
+}
+
+fn trim_handle_left_x(frame_boundary_x: f64) -> f64 {
+    frame_boundary_x - HANDLE_WIDTH / 2.0
 }
 
 fn draw_playhead(cr: &cairo::Context, width: f64, height: f64, state: &TimelineViewState) {
@@ -953,4 +961,31 @@ fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, ra
         std::f64::consts::PI * 1.5,
     );
     cr.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snap_seconds_to_frame_in_range_with_fps, trim_handle_left_x, HANDLE_WIDTH};
+
+    fn assert_close(left: f64, right: f64) {
+        assert!(
+            (left - right).abs() < 0.000_001,
+            "expected {left} to equal {right}"
+        );
+    }
+
+    #[test]
+    fn trim_handle_is_centered_on_frame_boundary() {
+        let frame_x = 240.0;
+        let handle_left = trim_handle_left_x(frame_x);
+
+        assert_close(handle_left + HANDLE_WIDTH / 2.0, frame_x);
+    }
+
+    #[test]
+    fn frame_snap_respects_source_frame_rate() {
+        let snapped = snap_seconds_to_frame_in_range_with_fps(0.044, 0.0, 1.0, Some(24.0));
+
+        assert_close(snapped, 1.0 / 24.0);
+    }
 }
