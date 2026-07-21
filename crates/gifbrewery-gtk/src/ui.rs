@@ -764,6 +764,7 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
     );
     group.add(&end);
     let speed = spin_row("Speed", clip.speed, 0.05, 8.0, 0.05);
+    speed.set_sensitive(false);
     group.add(&speed);
     let fps = spin_row(
         "Source frame rate",
@@ -2651,6 +2652,7 @@ fn show_export_preview(window: &adw::ApplicationWindow, output_path: &Path) {
         .default_width(760)
         .default_height(560)
         .modal(false)
+        .resizable(true)
         .build();
     preview.set_transient_for(Some(window));
 
@@ -2663,10 +2665,11 @@ fn show_export_preview(window: &adw::ApplicationWindow, output_path: &Path) {
         .margin_end(12)
         .build();
     let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::ScaleDown)
+        .content_fit(gtk::ContentFit::Contain)
         .vexpand(true)
         .hexpand(true)
         .build();
+    picture.set_size_request(720, 440);
     content.append(&picture);
 
     let footer = gtk::Box::builder()
@@ -2708,7 +2711,7 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
     let output_path = output_path.to_path_buf();
     let preview_dir =
         std::env::temp_dir().join(format!("gifbrewery-export-preview-{}", std::process::id()));
-    let (sender, receiver) = mpsc::channel::<Result<Vec<PathBuf>, String>>();
+    let (sender, receiver) = mpsc::channel::<Result<(Vec<PathBuf>, u64), String>>();
     thread::spawn(move || {
         let _ = std::fs::remove_dir_all(&preview_dir);
         if let Err(err) = std::fs::create_dir_all(&preview_dir) {
@@ -2718,12 +2721,16 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
             )));
             return;
         }
-        let pattern = preview_dir.join("preview-%06d.png");
+        let pattern = preview_dir.join("preview-%06d.jpg");
         let output = Command::new("ffmpeg")
             .arg("-hide_banner")
             .arg("-y")
             .arg("-i")
             .arg(&output_path)
+            .arg("-vf")
+            .arg("scale='min(960,iw)':'min(540,ih)':force_original_aspect_ratio=decrease")
+            .arg("-q:v")
+            .arg("5")
             .arg("-start_number")
             .arg("0")
             .arg(pattern)
@@ -2750,7 +2757,7 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
                 .filter(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("preview-") && name.ends_with(".png"))
+                        .is_some_and(|name| name.starts_with("preview-") && name.ends_with(".jpg"))
                 })
                 .collect::<Vec<_>>(),
             Err(err) => {
@@ -2767,7 +2774,8 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
                 "export preview extraction produced no frames".to_string()
             ));
         } else {
-            let _ = sender.send(Ok(frames));
+            let delay_ms = export_preview_delay_ms(&output_path, frames.len());
+            let _ = sender.send(Ok((frames, delay_ms)));
         }
     });
 
@@ -2777,20 +2785,54 @@ fn start_export_preview_animation(output_path: &Path, picture: gtk::Picture) {
             return glib::ControlFlow::Continue;
         };
         match result {
-            Ok(frames) => animate_picture_frames(picture.clone(), frames, 33),
+            Ok((frames, delay_ms)) => animate_picture_frames(picture.clone(), frames, delay_ms),
             Err(err) => crate::diagnostics::log_line(format_args!("{err}")),
         }
         glib::ControlFlow::Break
     });
 }
 
+fn export_preview_delay_ms(output_path: &Path, frame_count: usize) -> u64 {
+    let fallback = 33;
+    if frame_count == 0 {
+        return fallback;
+    }
+    let Ok(output) = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=duration")
+        .arg("-of")
+        .arg("default=nk=1:nw=1")
+        .arg(output_path)
+        .output()
+    else {
+        return fallback;
+    };
+    if !output.status.success() {
+        return fallback;
+    }
+    let duration = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
+    let Some(duration) = duration else {
+        return fallback;
+    };
+    let delay_ms = (duration * 1000.0 / frame_count as f64).round() as u64;
+    let delay_ms = delay_ms.clamp(10, 1000);
+    crate::diagnostics::log_line(format_args!(
+        "export preview animation timing: duration={duration:.3}s frames={frame_count} delay_ms={delay_ms}"
+    ));
+    delay_ms
+}
+
 fn animate_picture_frames(picture: gtk::Picture, frames: Vec<PathBuf>, delay_ms: u64) {
     let frames = Rc::new(frames);
     let index = Rc::new(Cell::new(0usize));
-    picture.set_content_fit(gtk::ContentFit::ScaleDown);
-    if let Ok(texture) = gdk::Texture::from_file(&gio::File::for_path(&frames[0])) {
-        picture.set_size_request(texture.width(), texture.height());
-    }
+    picture.set_content_fit(gtk::ContentFit::Contain);
     picture.set_file(Some(&gio::File::for_path(&frames[0])));
     glib::timeout_add_local(std::time::Duration::from_millis(delay_ms), move || {
         let next = (index.get() + 1) % frames.len();
@@ -2879,12 +2921,15 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
         return;
     }
 
+    if !preparing {
+        defer_rendered_playback_preload(state, widgets, "playback requested");
+    }
     widgets.editor.source_title.set_label(if preparing {
         "Preview frames still loading..."
     } else {
-        "Preview frames are not ready"
+        "Preparing preview frames..."
     });
-    widgets.editor.export_status.set_visible(preparing);
+    widgets.editor.export_status.set_visible(true);
     widgets.editor.export_status.set_label("Please wait");
     crate::diagnostics::log_line(format_args!(
         "playback requested before frame cache was ready: playhead={start_seconds:.3}s preparing={preparing}"
@@ -3086,14 +3131,10 @@ fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, _m
     update_timeline_widgets(state, widgets);
 }
 
-fn update_clip_speed(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, speed: f64) {
-    {
-        let mut state = state.borrow_mut();
-        if let Some(clip) = state.project.clips.first_mut() {
-            clip.speed = speed.clamp(0.05, 8.0);
-            invalidate_render_outputs(&mut state);
-        }
-    }
+fn update_clip_speed(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, _speed: f64) {
+    crate::diagnostics::log_line(format_args!(
+        "clip speed ignored: speed rendering is not implemented"
+    ));
     update_timeline_widgets(state, widgets);
 }
 
@@ -4495,8 +4536,8 @@ fn rendered_playback_cache_key(project: &Project) -> String {
     }
     if let Some(clip) = project.clips.first() {
         key.push_str(&format!(
-            "{:.6}:{:.6}:{:.6}:{:?};",
-            clip.range.start_seconds, clip.range.end_seconds, clip.speed, clip.crop
+            "{:.6}:{:.6}:{:?};",
+            clip.range.start_seconds, clip.range.end_seconds, clip.crop
         ));
         key.push_str(&format!("{:?};", clip.frame_strategy));
     }

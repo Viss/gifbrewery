@@ -1,8 +1,3 @@
-<img width="1282" height="821" alt="image" src="https://github.com/user-attachments/assets/fb301141-93ad-4b27-a6d4-7498f04a4048" />
-<img width="1282" height="821" alt="image" src="https://github.com/user-attachments/assets/75fdb35e-95bd-4183-80b6-3e8f196cae08" />
-<img width="600" height="250" alt="one_ring_go_fuck_yourself" src="https://github.com/user-attachments/assets/66595cc5-3034-4181-8fc6-64936e948b6a" />
-
-
 # Janky gifbrewery linux clone in rust! 
 
 I used gpt5.5 to do this build for me. It took me something like 6 days, because 5.5 on medium think only lets me run for ~30-90 minutes a day with the subscription I have. 

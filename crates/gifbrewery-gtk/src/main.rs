@@ -83,6 +83,7 @@ fn maybe_run_smoke_export() -> Option<glib::ExitCode> {
     if command != "--smoke-export"
         && command != "--smoke-export-multi-overlay"
         && command != "--smoke-export-layout"
+        && command != "--smoke-export-width"
         && command != "--smoke-render-frame"
         && command != "--smoke-compare-preview"
         && command != "--smoke-crop-playback"
@@ -112,6 +113,13 @@ fn maybe_run_smoke_export() -> Option<glib::ExitCode> {
             compare_preview_smoke_project(source_path)
         }
         "--smoke-export-layout" | "--smoke-render-frame" => layout_smoke_project(source_path),
+        "--smoke-export-width" => {
+            let Some(width) = args.next().and_then(|width| width.parse::<u32>().ok()) else {
+                eprintln!("usage: gifbrewery-gtk --smoke-export-width SOURCE OUTPUT WIDTH");
+                return Some(glib::ExitCode::FAILURE);
+            };
+            resized_smoke_project(source_path, width)
+        }
         _ => smoke_project(source_path),
     };
 
@@ -192,6 +200,31 @@ fn smoke_project(source_path: String) -> Project {
         natural_height: metadata.as_ref().and_then(|metadata| metadata.height),
         fps: metadata.as_ref().and_then(|metadata| metadata.fps),
     });
+    project
+}
+
+fn full_duration_smoke_project(source_path: String) -> Project {
+    let mut project = smoke_project(source_path);
+    if let Some(duration_seconds) = project
+        .source
+        .as_ref()
+        .and_then(|source| source.duration_seconds)
+        .filter(|duration| *duration > 0.0)
+    {
+        if let Some(clip) = project.clips.first_mut() {
+            clip.range = TimelineRange {
+                start_seconds: 0.0,
+                end_seconds: duration_seconds,
+            };
+        }
+    }
+    project
+}
+
+fn resized_smoke_project(source_path: String, width: u32) -> Project {
+    let mut project = full_duration_smoke_project(source_path);
+    project.settings.gif.output_width = Some(width.max(1));
+    project.settings.gif.output_height = None;
     project
 }
 
