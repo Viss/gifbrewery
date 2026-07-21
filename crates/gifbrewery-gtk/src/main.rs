@@ -254,19 +254,20 @@ fn layout_smoke_project(source_path: String) -> Project {
             start_seconds: 0.0,
             end_seconds: 2.0,
         };
-        clip.crop = Some(CropRect {
-            left: 0.05,
-            right: 0.05,
-            top: 0.08,
-            bottom: 0.08,
-        });
+        clip.crop = None;
     }
-    project.settings.gif.output_width = Some(640);
-    project.settings.gif.output_height = Some(360);
+    project.settings.gif.output_width = project
+        .source
+        .as_ref()
+        .and_then(|source| source.natural_width);
+    project.settings.gif.output_height = project
+        .source
+        .as_ref()
+        .and_then(|source| source.natural_height);
 
     let mut text = TextOverlay::default_caption();
     text.id = "caption-layout-smoke".to_string();
-    text.text = "Layout smoke\nstroke + resize".to_string();
+    text.text = "GET IN".to_string();
     text.range = TimelineRange {
         start_seconds: 0.0,
         end_seconds: 2.0,
@@ -277,8 +278,9 @@ fn layout_smoke_project(source_path: String) -> Project {
         width: 0.84,
         height: 0.24,
     };
-    text.font_size = 42.0;
-    text.stroke_width = 4.0;
+    text.font_size = 48.0;
+    text.stroke_width = 4.5;
+    text.font_family = "Px437 IBM BIOS".to_string();
     text.text_color = RgbaColor::WHITE;
     text.stroke_color = RgbaColor::BLACK;
     project.overlays = vec![Overlay::Text(text)];
