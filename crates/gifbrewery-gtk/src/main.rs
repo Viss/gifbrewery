@@ -84,6 +84,7 @@ fn maybe_run_smoke_export() -> Option<glib::ExitCode> {
         && command != "--smoke-export-multi-overlay"
         && command != "--smoke-export-layout"
         && command != "--smoke-export-width"
+        && command != "--smoke-export-width-range"
         && command != "--smoke-render-frame"
         && command != "--smoke-compare-preview"
         && command != "--smoke-crop-playback"
@@ -119,6 +120,28 @@ fn maybe_run_smoke_export() -> Option<glib::ExitCode> {
                 return Some(glib::ExitCode::FAILURE);
             };
             resized_smoke_project(source_path, width)
+        }
+        "--smoke-export-width-range" => {
+            let Some(width) = args.next().and_then(|width| width.parse::<u32>().ok()) else {
+                eprintln!(
+                    "usage: gifbrewery-gtk --smoke-export-width-range SOURCE OUTPUT WIDTH START_SECONDS END_SECONDS"
+                );
+                return Some(glib::ExitCode::FAILURE);
+            };
+            let Some(start_seconds) = args.next().and_then(|start| start.parse::<f64>().ok())
+            else {
+                eprintln!(
+                    "usage: gifbrewery-gtk --smoke-export-width-range SOURCE OUTPUT WIDTH START_SECONDS END_SECONDS"
+                );
+                return Some(glib::ExitCode::FAILURE);
+            };
+            let Some(end_seconds) = args.next().and_then(|end| end.parse::<f64>().ok()) else {
+                eprintln!(
+                    "usage: gifbrewery-gtk --smoke-export-width-range SOURCE OUTPUT WIDTH START_SECONDS END_SECONDS"
+                );
+                return Some(glib::ExitCode::FAILURE);
+            };
+            resized_range_smoke_project(source_path, width, start_seconds, end_seconds)
         }
         _ => smoke_project(source_path),
     };
@@ -199,6 +222,18 @@ fn smoke_project(source_path: String) -> Project {
         natural_width: metadata.as_ref().and_then(|metadata| metadata.width),
         natural_height: metadata.as_ref().and_then(|metadata| metadata.height),
         fps: metadata.as_ref().and_then(|metadata| metadata.fps),
+        color_space: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.color_space.clone()),
+        color_transfer: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.color_transfer.clone()),
+        color_primaries: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.color_primaries.clone()),
+        pixel_format: metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pixel_format.clone()),
     });
     project
 }
@@ -225,6 +260,24 @@ fn resized_smoke_project(source_path: String, width: u32) -> Project {
     let mut project = full_duration_smoke_project(source_path);
     project.settings.gif.output_width = Some(width.max(1));
     project.settings.gif.output_height = None;
+    project
+}
+
+fn resized_range_smoke_project(
+    source_path: String,
+    width: u32,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Project {
+    let mut project = smoke_project(source_path);
+    project.settings.gif.output_width = Some(width.max(1));
+    project.settings.gif.output_height = None;
+    if let Some(clip) = project.clips.first_mut() {
+        clip.range = TimelineRange {
+            start_seconds: start_seconds.max(0.0),
+            end_seconds: end_seconds.max(start_seconds + 0.01),
+        };
+    }
     project
 }
 

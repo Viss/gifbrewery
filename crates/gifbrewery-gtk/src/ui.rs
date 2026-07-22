@@ -319,9 +319,9 @@ struct InspectorWidgets {
     clip_mark_end: gtk::Button,
     clip_speed: adw::SpinRow,
     clip_fps: adw::SpinRow,
+    target_size_enabled: adw::SwitchRow,
     target_size_mb: adw::SpinRow,
     optimize_gif: adw::SwitchRow,
-    high_quality_quantization: adw::SwitchRow,
     output_width: adw::SpinRow,
     output_height: adw::SpinRow,
     crop_left: adw::SpinRow,
@@ -727,9 +727,9 @@ fn build_inspector(project: &Project) -> (gtk::Box, InspectorWidgets) {
             clip_mark_end: clip_widgets.mark_end,
             clip_speed: clip_widgets.speed,
             clip_fps: clip_widgets.fps,
+            target_size_enabled: gif_widgets.target_size_enabled,
             target_size_mb: gif_widgets.target_size_mb,
             optimize_gif: gif_widgets.optimize,
-            high_quality_quantization: gif_widgets.high_quality_quantization,
             output_width: gif_widgets.output_width,
             output_height: gif_widgets.output_height,
             crop_left: gif_widgets.crop_left,
@@ -833,9 +833,9 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
 }
 
 struct GifInspectorWidgets {
+    target_size_enabled: adw::SwitchRow,
     target_size_mb: adw::SpinRow,
     optimize: adw::SwitchRow,
-    high_quality_quantization: adw::SwitchRow,
     output_width: adw::SpinRow,
     output_height: adw::SpinRow,
     crop_left: adw::SpinRow,
@@ -869,12 +869,12 @@ fn build_gif_page(project: &Project) -> (gtk::ScrolledWindow, GifInspectorWidget
         99.0,
         1.0,
     );
+    let target_size_enabled =
+        switch_row("Enforce target size", settings.target_max_bytes.is_some());
     let optimize = switch_row("Optimize GIF", settings.optimize);
-    let high_quality_quantization = switch_row(
-        "Maximum quality palettes",
-        settings.high_quality_quantization,
-    );
-    group.add(&high_quality_quantization);
+    group.add(&target_size_enabled);
+    group.add(&target_size_mb);
+    group.add(&optimize);
     page.add(&group);
 
     let size_group = adw::PreferencesGroup::builder().title("Resize").build();
@@ -914,9 +914,9 @@ fn build_gif_page(project: &Project) -> (gtk::ScrolledWindow, GifInspectorWidget
     (
         scrolled_page(page),
         GifInspectorWidgets {
+            target_size_enabled,
             target_size_mb,
             optimize,
-            high_quality_quantization,
             output_width,
             output_height,
             crop_left,
@@ -1388,6 +1388,10 @@ fn bytes_to_megabytes(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
 }
 
+fn megabytes_to_bytes(megabytes: f64) -> u64 {
+    (megabytes.max(0.1) * 1024.0 * 1024.0).round() as u64
+}
+
 fn clip_fps_value(strategy: &FrameStrategy) -> f64 {
     match strategy {
         FrameStrategy::Fps(fps) => f64::from(*fps),
@@ -1505,6 +1509,38 @@ fn effective_output_dimensions(project: &Project) -> Option<(u32, u32)> {
             height.max(1),
         )),
         (None, None) => crop_dimensions,
+    }
+}
+
+fn reconcile_output_dimensions_for_export(
+    project: &mut Project,
+    visible_width: f64,
+    visible_height: f64,
+) {
+    let visible_width = visible_width.round().max(0.0) as u32;
+    let visible_height = visible_height.round().max(0.0) as u32;
+    if visible_width < 2 || visible_height < 2 {
+        return;
+    }
+
+    let source_dimensions = cropped_source_dimensions(project).map(|(width, height)| {
+        (
+            width.round().max(1.0) as u32,
+            height.round().max(1.0) as u32,
+        )
+    });
+    let configured_dimensions = (
+        project.settings.gif.output_width,
+        project.settings.gif.output_height,
+    );
+    let visible_dimensions = (visible_width, visible_height);
+
+    if configured_dimensions.0.is_some()
+        || configured_dimensions.1.is_some()
+        || Some(visible_dimensions) != source_dimensions
+    {
+        project.settings.gif.output_width = Some(visible_width);
+        project.settings.gif.output_height = Some(visible_height);
     }
 }
 
@@ -1741,6 +1777,20 @@ fn install_widget_bindings(
 
     widgets
         .inspector
+        .target_size_enabled
+        .connect_notify_local(Some("active"), {
+            let state = Rc::clone(state);
+            let widgets = widgets.clone();
+            move |row, _| {
+                if state.borrow().syncing_widgets {
+                    return;
+                }
+                update_target_size_enabled(&state, &widgets, row.is_active());
+            }
+        });
+
+    widgets
+        .inspector
         .target_size_mb
         .connect_notify_local(Some("value"), {
             let state = Rc::clone(state);
@@ -1792,20 +1842,6 @@ fn install_widget_bindings(
                     return;
                 }
                 update_optimize_gif(&state, &widgets, row.is_active());
-            }
-        });
-
-    widgets
-        .inspector
-        .high_quality_quantization
-        .connect_notify_local(Some("active"), {
-            let state = Rc::clone(state);
-            let widgets = widgets.clone();
-            move |row, _| {
-                if state.borrow().syncing_widgets {
-                    return;
-                }
-                update_high_quality_quantization(&state, &widgets, row.is_active());
             }
         });
 
@@ -2333,6 +2369,18 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
             natural_width: metadata.as_ref().and_then(|metadata| metadata.width),
             natural_height: metadata.as_ref().and_then(|metadata| metadata.height),
             fps: source_fps,
+            color_space: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.color_space.clone()),
+            color_transfer: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.color_transfer.clone()),
+            color_primaries: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.color_primaries.clone()),
+            pixel_format: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pixel_format.clone()),
         });
         state.playhead_seconds = 0.0;
         state.thumbnails = Vec::new();
@@ -2709,10 +2757,23 @@ fn export_current_gif(
     widgets: &AppWidgets,
     window: &adw::ApplicationWindow,
 ) {
-    let project = state.borrow().project.clone();
+    let mut project = state.borrow().project.clone();
+    reconcile_output_dimensions_for_export(
+        &mut project,
+        widgets.inspector.output_width.value(),
+        widgets.inspector.output_height.value(),
+    );
     if project.source.is_none() {
         return;
     }
+    crate::diagnostics::log_line(format_args!(
+        "export requested: output_width={:?} output_height={:?} visible_resize={}x{} effective={:?}",
+        project.settings.gif.output_width,
+        project.settings.gif.output_height,
+        widgets.inspector.output_width.value(),
+        widgets.inspector.output_height.value(),
+        effective_output_dimensions(&project)
+    ));
 
     let dialog = gtk::FileDialog::builder()
         .title("Save GIF")
@@ -3416,10 +3477,21 @@ fn mark_clip_end_at_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets
     update_clip_end_frame(state, widgets, end_frame);
 }
 
-fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, _megabytes: f64) {
+fn update_target_size_enabled(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, enabled: bool) {
     {
         let mut state = state.borrow_mut();
-        state.project.settings.gif.target_max_bytes = None;
+        state.project.settings.gif.target_max_bytes =
+            enabled.then(|| megabytes_to_bytes(widgets.inspector.target_size_mb.value()));
+    }
+    update_timeline_widgets(state, widgets);
+}
+
+fn update_target_size_mb(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, megabytes: f64) {
+    {
+        let mut state = state.borrow_mut();
+        if state.project.settings.gif.target_max_bytes.is_some() {
+            state.project.settings.gif.target_max_bytes = Some(megabytes_to_bytes(megabytes));
+        }
     }
     update_timeline_widgets(state, widgets);
 }
@@ -3446,18 +3518,6 @@ fn update_optimize_gif(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, enab
     {
         let mut state = state.borrow_mut();
         state.project.settings.gif.optimize = enabled;
-    }
-    update_timeline_widgets(state, widgets);
-}
-
-fn update_high_quality_quantization(
-    state: &Rc<RefCell<AppState>>,
-    widgets: &AppWidgets,
-    enabled: bool,
-) {
-    {
-        let mut state = state.borrow_mut();
-        state.project.settings.gif.high_quality_quantization = enabled;
     }
     update_timeline_widgets(state, widgets);
 }
@@ -4336,18 +4396,19 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
             .and_then(|source| source.fps)
             .unwrap_or(0.0),
     );
-    widgets
-        .inspector
-        .optimize_gif
-        .set_active(state.borrow().project.settings.gif.optimize);
-    widgets.inspector.high_quality_quantization.set_active(
+    widgets.inspector.target_size_enabled.set_active(
         state
             .borrow()
             .project
             .settings
             .gif
-            .high_quality_quantization,
+            .target_max_bytes
+            .is_some(),
     );
+    widgets
+        .inspector
+        .optimize_gif
+        .set_active(state.borrow().project.settings.gif.optimize);
     let output_dimensions = effective_output_dimensions(&state.borrow().project);
     widgets.inspector.output_width.set_value(
         output_dimensions
@@ -4823,8 +4884,15 @@ fn rendered_playback_cache_key(project: &Project) -> String {
         key.push_str(&source.path);
         key.push(';');
         key.push_str(&format!(
-            "{:?}:{:?}:{:?}:{:?};",
-            source.duration_seconds, source.natural_width, source.natural_height, source.fps
+            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?};",
+            source.duration_seconds,
+            source.natural_width,
+            source.natural_height,
+            source.fps,
+            source.color_space,
+            source.color_transfer,
+            source.color_primaries,
+            source.pixel_format
         ));
     }
     if let Some(clip) = project.clips.first() {
@@ -5184,6 +5252,22 @@ fn compact_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    fn output_test_project() -> Project {
+        let mut project = Project::default();
+        project.source = Some(MediaSource {
+            path: "source.mp4".to_string(),
+            duration_seconds: Some(2.0),
+            natural_width: Some(3840),
+            natural_height: Some(2160),
+            fps: Some(24.0),
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            pixel_format: None,
+        });
+        project
+    }
+
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 0.000_001,
@@ -5278,5 +5362,37 @@ mod tests {
             next.saturating_duration_since(now).as_secs_f64(),
             frame_duration,
         );
+    }
+
+    #[test]
+    fn export_reconcile_preserves_unresized_source_dimensions_as_auto() {
+        let mut project = output_test_project();
+
+        reconcile_output_dimensions_for_export(&mut project, 3840.0, 2160.0);
+
+        assert_eq!(project.settings.gif.output_width, None);
+        assert_eq!(project.settings.gif.output_height, None);
+    }
+
+    #[test]
+    fn export_reconcile_recovers_visible_resize_when_model_missed_signal() {
+        let mut project = output_test_project();
+
+        reconcile_output_dimensions_for_export(&mut project, 800.0, 450.0);
+
+        assert_eq!(project.settings.gif.output_width, Some(800));
+        assert_eq!(project.settings.gif.output_height, Some(450));
+    }
+
+    #[test]
+    fn export_reconcile_keeps_latest_visible_resize_over_stale_model() {
+        let mut project = output_test_project();
+        project.settings.gif.output_width = Some(1280);
+        project.settings.gif.output_height = Some(720);
+
+        reconcile_output_dimensions_for_export(&mut project, 800.0, 450.0);
+
+        assert_eq!(project.settings.gif.output_width, Some(800));
+        assert_eq!(project.settings.gif.output_height, Some(450));
     }
 }

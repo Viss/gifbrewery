@@ -48,6 +48,14 @@ pub struct MediaSource {
     pub natural_height: Option<u32>,
     #[serde(default)]
     pub fps: Option<f64>,
+    #[serde(default)]
+    pub color_space: Option<String>,
+    #[serde(default)]
+    pub color_transfer: Option<String>,
+    #[serde(default)]
+    pub color_primaries: Option<String>,
+    #[serde(default)]
+    pub pixel_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -254,6 +262,8 @@ pub struct GifExportSettings {
     pub high_quality_quantization: bool,
     pub target_max_bytes: Option<u64>,
     #[serde(default)]
+    pub tone_map_hdr: bool,
+    #[serde(default)]
     pub output_width: Option<u32>,
     #[serde(default)]
     pub output_height: Option<u32>,
@@ -263,9 +273,10 @@ impl Default for GifExportSettings {
     fn default() -> Self {
         Self {
             colors: 256,
-            optimize: false,
-            high_quality_quantization: true,
+            optimize: true,
+            high_quality_quantization: false,
             target_max_bytes: None,
+            tone_map_hdr: false,
             output_width: None,
             output_height: None,
         }

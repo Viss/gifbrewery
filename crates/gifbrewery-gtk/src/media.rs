@@ -10,6 +10,10 @@ pub struct MediaMetadata {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<f64>,
+    pub color_space: Option<String>,
+    pub color_transfer: Option<String>,
+    pub color_primaries: Option<String>,
+    pub pixel_format: Option<String>,
 }
 
 pub fn discover(file: &gio::File) -> Result<MediaMetadata, glib::Error> {
@@ -52,6 +56,18 @@ pub fn discover(file: &gio::File) -> Result<MediaMetadata, glib::Error> {
             .and_then(|metadata| metadata.height)
             .or_else(|| video.as_ref().map(|stream| stream.height())),
         fps: ffprobe.as_ref().and_then(|metadata| metadata.fps).or(fps),
+        color_space: ffprobe
+            .as_ref()
+            .and_then(|metadata| metadata.color_space.clone()),
+        color_transfer: ffprobe
+            .as_ref()
+            .and_then(|metadata| metadata.color_transfer.clone()),
+        color_primaries: ffprobe
+            .as_ref()
+            .and_then(|metadata| metadata.color_primaries.clone()),
+        pixel_format: ffprobe
+            .as_ref()
+            .and_then(|metadata| metadata.pixel_format.clone()),
     })
 }
 
@@ -62,7 +78,7 @@ fn probe_video_metadata(path: &std::path::Path) -> Option<MediaMetadata> {
         .arg("-select_streams")
         .arg("v:0")
         .arg("-show_entries")
-        .arg("stream=width,height,r_frame_rate,avg_frame_rate,duration")
+        .arg("stream=width,height,r_frame_rate,avg_frame_rate,duration,color_space,color_transfer,color_primaries,pix_fmt")
         .arg("-of")
         .arg("default=nw=1")
         .arg(path)
@@ -102,6 +118,11 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
     parse_positive_float(value)
 }
 
+fn parse_known_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value != "N/A" && value != "unknown").then(|| value.to_string())
+}
+
 fn parse_ffprobe_video_metadata(output: &str) -> Option<MediaMetadata> {
     let mut metadata = MediaMetadata::default();
     let mut r_frame_rate = None;
@@ -117,6 +138,10 @@ fn parse_ffprobe_video_metadata(output: &str) -> Option<MediaMetadata> {
             "duration" => metadata.duration_seconds = parse_positive_float(value),
             "r_frame_rate" => r_frame_rate = parse_frame_rate(value),
             "avg_frame_rate" => avg_frame_rate = parse_frame_rate(value),
+            "color_space" => metadata.color_space = parse_known_string(value),
+            "color_transfer" => metadata.color_transfer = parse_known_string(value),
+            "color_primaries" => metadata.color_primaries = parse_known_string(value),
+            "pix_fmt" => metadata.pixel_format = parse_known_string(value),
             _ => {}
         }
     }
@@ -125,7 +150,11 @@ fn parse_ffprobe_video_metadata(output: &str) -> Option<MediaMetadata> {
     (metadata.duration_seconds.is_some()
         || metadata.width.is_some()
         || metadata.height.is_some()
-        || metadata.fps.is_some())
+        || metadata.fps.is_some()
+        || metadata.color_space.is_some()
+        || metadata.color_transfer.is_some()
+        || metadata.color_primaries.is_some()
+        || metadata.pixel_format.is_some())
     .then_some(metadata)
 }
 
@@ -144,7 +173,7 @@ mod tests {
     #[test]
     fn parses_ffprobe_video_metadata() {
         let metadata = parse_ffprobe_video_metadata(
-            "width=3840\nheight=2160\nr_frame_rate=24/1\navg_frame_rate=24/1\nduration=2.083333\n",
+            "width=3840\nheight=2160\nr_frame_rate=24/1\navg_frame_rate=24/1\nduration=2.083333\ncolor_space=bt2020nc\ncolor_transfer=smpte2084\ncolor_primaries=bt2020\npix_fmt=yuv420p10le\n",
         )
         .expect("metadata");
 
@@ -152,5 +181,9 @@ mod tests {
         assert_eq!(metadata.height, Some(2160));
         assert_eq!(metadata.fps, Some(24.0));
         assert_eq!(metadata.duration_seconds, Some(2.083333));
+        assert_eq!(metadata.color_space.as_deref(), Some("bt2020nc"));
+        assert_eq!(metadata.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(metadata.color_primaries.as_deref(), Some("bt2020"));
+        assert_eq!(metadata.pixel_format.as_deref(), Some("yuv420p10le"));
     }
 }

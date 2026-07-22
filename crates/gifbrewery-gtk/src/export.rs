@@ -32,30 +32,144 @@ where
     let fps = export_fps(project)?;
 
     let geometry = RenderGeometry::from_project(project, clip, 1.0);
+    let target_max_bytes = project
+        .settings
+        .gif
+        .target_max_bytes
+        .filter(|bytes| *bytes > 0);
+    let attempts = render_attempts(project);
+    let mut final_size = 0;
+    let mut final_attempt = None;
+
     progress(ExportProgress {
         percent: Some(0),
-        message: "Exporting maximum-quality GIF...".to_string(),
+        message: if let Some(target) = target_max_bytes {
+            format!(
+                "Exporting GIF with {:.1} MB target...",
+                target as f64 / 1024.0 / 1024.0
+            )
+        } else {
+            "Exporting maximum-quality GIF...".to_string()
+        },
     });
-    render_gif_once(project, output_path, clip, fps, geometry, &progress)?;
-    let size = fs::metadata(output_path)
-        .map_err(|err| format!("failed to inspect exported GIF size: {err}"))?
-        .len();
+
+    for (attempt_index, attempt) in attempts.iter().enumerate() {
+        let mut attempt_project = project.clone();
+        attempt_project.settings.gif.colors = attempt.colors;
+        attempt_project.settings.gif.high_quality_quantization = attempt.high_quality_quantization;
+        let attempt_clip = attempt_project
+            .clips
+            .first()
+            .ok_or_else(|| "project has no clip".to_string())?;
+
+        crate::diagnostics::log_line(format_args!(
+            "GIF export attempt {}: colors={} high_quality_palette={} target={:?}",
+            attempt_index + 1,
+            attempt.colors,
+            attempt.high_quality_quantization,
+            target_max_bytes
+        ));
+        render_gif_once(
+            &attempt_project,
+            output_path,
+            attempt_clip,
+            fps,
+            geometry,
+            &progress,
+        )?;
+        let size = fs::metadata(output_path)
+            .map_err(|err| format!("failed to inspect exported GIF size: {err}"))?
+            .len();
+        crate::diagnostics::log_line(format_args!(
+            "GIF export attempt {} complete: {} bytes at {}x{} colors={} high_quality_palette={}",
+            attempt_index + 1,
+            size,
+            geometry.output_width,
+            geometry.output_height,
+            attempt.colors,
+            attempt.high_quality_quantization
+        ));
+        final_size = size;
+        final_attempt = Some(*attempt);
+
+        if target_max_bytes.is_none_or(|target| size <= target) {
+            break;
+        }
+    }
+
+    if let (Some(target), Some(attempt)) = (target_max_bytes, final_attempt) {
+        if final_size > target {
+            crate::diagnostics::log_line(format_args!(
+                "GIF export target not met: final_size={} target={} colors={} high_quality_palette={}",
+                final_size,
+                target,
+                attempt.colors,
+                attempt.high_quality_quantization
+            ));
+        }
+    }
+
     crate::diagnostics::log_line(format_args!(
-        "GIF export complete: {} bytes at {}x{} timing={} max_quality=true",
-        size,
+        "GIF export complete: {} bytes at {}x{} timing={} colors={} high_quality_palette={} target={:?}",
+        final_size,
         geometry.output_width,
         geometry.output_height,
         if source_is_gif(project) {
             "source".to_string()
         } else {
             format!("{fps}fps")
-        }
+        },
+        final_attempt.map(|attempt| attempt.colors).unwrap_or(project.settings.gif.colors),
+        final_attempt
+            .map(|attempt| attempt.high_quality_quantization)
+            .unwrap_or(project.settings.gif.high_quality_quantization),
+        target_max_bytes
     ));
     progress(ExportProgress {
         percent: Some(100),
         message: "Finalizing GIF loop metadata...".to_string(),
     });
     ensure_gif_loops_forever(output_path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderAttempt {
+    colors: u16,
+    high_quality_quantization: bool,
+}
+
+fn render_attempts(project: &Project) -> Vec<RenderAttempt> {
+    let settings = &project.settings.gif;
+    let mut attempts = Vec::new();
+
+    let mut push_attempt = |colors: u16, high_quality_quantization: bool| {
+        let attempt = RenderAttempt {
+            colors: colors.clamp(2, 256),
+            high_quality_quantization,
+        };
+        if !attempts.contains(&attempt) {
+            attempts.push(attempt);
+        }
+    };
+
+    let requested_colors = settings.colors.clamp(2, 256);
+    let target_enabled = settings.target_max_bytes.is_some();
+    let start_high_quality = settings.high_quality_quantization && !settings.optimize;
+    push_attempt(requested_colors, start_high_quality);
+
+    if target_enabled || settings.optimize {
+        push_attempt(requested_colors, false);
+    }
+
+    if target_enabled && !settings.optimize {
+        for colors in [192, 128] {
+            if colors < requested_colors {
+                push_attempt(colors, false);
+            }
+        }
+    }
+
+    attempts
 }
 
 pub fn render_frame_png(
@@ -478,6 +592,18 @@ fn video_filter(
     if let Some(fps) = fps {
         filters.push(format!("fps={fps}"));
     }
+    if source_needs_hdr_conversion(project) {
+        if let Some(source) = &project.source {
+            crate::diagnostics::log_line(format_args!(
+                "automatic HDR-to-SDR conversion: color_space={:?} color_transfer={:?} color_primaries={:?} pixel_format={:?}",
+                source.color_space,
+                source.color_transfer,
+                source.color_primaries,
+                source.pixel_format
+            ));
+        }
+        filters.extend(hdr_to_sdr_filters());
+    }
     if let Some(crop) = clip.crop.map(|crop| normalized_crop(Some(crop))) {
         if crop.left > 0.0 || crop.right > 0.0 || crop.top > 0.0 || crop.bottom > 0.0 {
             filters.push(format!(
@@ -521,8 +647,42 @@ fn video_filter(
     Ok(filters.join(","))
 }
 
+fn source_needs_hdr_conversion(project: &Project) -> bool {
+    let Some(source) = &project.source else {
+        return false;
+    };
+    source
+        .color_transfer
+        .as_deref()
+        .is_some_and(is_hdr_transfer)
+        || source
+            .color_primaries
+            .as_deref()
+            .is_some_and(|primaries| primaries.eq_ignore_ascii_case("bt2020"))
+}
+
+fn is_hdr_transfer(transfer: &str) -> bool {
+    transfer.eq_ignore_ascii_case("smpte2084")
+        || transfer.eq_ignore_ascii_case("arib-std-b67")
+        || transfer.eq_ignore_ascii_case("hlg")
+}
+
+fn hdr_to_sdr_filters() -> Vec<String> {
+    vec![
+        "zscale=t=linear:npl=100".to_string(),
+        "format=gbrpf32le".to_string(),
+        "tonemap=tonemap=hable:desat=0".to_string(),
+        "zscale=p=bt709:t=bt709:m=bt709:r=tv".to_string(),
+        "format=yuv420p".to_string(),
+    ]
+}
+
 fn palette_filter(project: &Project, video_filter: &str) -> String {
     let colors = project.settings.gif.colors.clamp(2, 256);
+    if project.settings.gif.optimize && !project.settings.gif.high_quality_quantization {
+        return video_filter.to_string();
+    }
+
     if project.settings.gif.high_quality_quantization {
         format!(
             "{video_filter},split[gifbrewery_palette_src][gifbrewery_frames];\
@@ -809,7 +969,10 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_fps, gif_loop_count, RenderGeometry};
+    use super::{
+        export_fps, gif_loop_count, palette_filter, render_attempts, source_needs_hdr_conversion,
+        video_filter, RenderAttempt, RenderGeometry,
+    };
     use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
 
     fn gif_with_loop_count(count: u16) -> Vec<u8> {
@@ -883,6 +1046,143 @@ mod tests {
         assert!(err.contains("frame rate is unknown"));
     }
 
+    #[test]
+    fn hdr_source_gets_automatic_sdr_conversion_before_palette() {
+        let mut project = geometry_test_project();
+        let source = project.source.as_mut().expect("test project has source");
+        source.color_space = Some("bt2020nc".to_string());
+        source.color_transfer = Some("smpte2084".to_string());
+        source.color_primaries = Some("bt2020".to_string());
+        source.pixel_format = Some("yuv420p10le".to_string());
+        project.settings.gif.output_width = Some(300);
+        project.settings.gif.output_height = Some(150);
+        let clip = project.clips.first().expect("default project has a clip");
+        let geometry = RenderGeometry::from_project(&project, clip, 1.0);
+
+        let filter = video_filter(
+            &project,
+            clip,
+            Some(24),
+            geometry,
+            std::path::Path::new("/tmp"),
+        )
+        .expect("filter");
+
+        assert!(source_needs_hdr_conversion(&project));
+        assert!(filter.contains("zscale=t=linear:npl=100"));
+        assert!(filter.contains("tonemap=tonemap=hable:desat=0"));
+        assert!(filter.contains("zscale=p=bt709:t=bt709:m=bt709:r=tv"));
+        assert!(
+            filter.find("tonemap=tonemap=hable").expect("tonemap")
+                < filter.find(",scale=").expect("scale")
+        );
+    }
+
+    #[test]
+    fn hdr_source_conversion_does_not_depend_on_legacy_toggle() {
+        let mut project = geometry_test_project();
+        let source = project.source.as_mut().expect("test project has source");
+        source.color_space = Some("bt2020nc".to_string());
+        source.color_transfer = Some("smpte2084".to_string());
+        source.color_primaries = Some("bt2020".to_string());
+
+        project.settings.gif.tone_map_hdr = false;
+        assert!(source_needs_hdr_conversion(&project));
+
+        project.settings.gif.tone_map_hdr = true;
+        assert!(source_needs_hdr_conversion(&project));
+    }
+
+    #[test]
+    fn sdr_source_does_not_get_tonemap() {
+        let project = geometry_test_project();
+        let clip = project.clips.first().expect("default project has a clip");
+        let geometry = RenderGeometry::from_project(&project, clip, 1.0);
+
+        let filter = video_filter(
+            &project,
+            clip,
+            Some(24),
+            geometry,
+            std::path::Path::new("/tmp"),
+        )
+        .expect("filter");
+
+        assert!(!source_needs_hdr_conversion(&project));
+        assert!(!filter.contains("tonemap="));
+    }
+
+    #[test]
+    fn target_size_adds_smaller_palette_attempts() {
+        let mut project = geometry_test_project();
+        project.settings.gif.colors = 256;
+        project.settings.gif.high_quality_quantization = true;
+        project.settings.gif.optimize = false;
+        project.settings.gif.target_max_bytes = Some(16 * 1024 * 1024);
+
+        let attempts = render_attempts(&project);
+
+        assert_eq!(
+            attempts[..3],
+            [
+                RenderAttempt {
+                    colors: 256,
+                    high_quality_quantization: true,
+                },
+                RenderAttempt {
+                    colors: 256,
+                    high_quality_quantization: false,
+                },
+                RenderAttempt {
+                    colors: 192,
+                    high_quality_quantization: false,
+                },
+            ]
+        );
+        assert!(attempts.contains(&RenderAttempt {
+            colors: 128,
+            high_quality_quantization: false,
+        }));
+        assert!(!attempts.iter().any(|attempt| attempt.colors < 128));
+    }
+
+    #[test]
+    fn optimized_export_uses_compact_native_gif_encoder() {
+        let mut project = geometry_test_project();
+        project.settings.gif.optimize = true;
+        project.settings.gif.high_quality_quantization = false;
+        project.settings.gif.target_max_bytes = Some(16 * 1024 * 1024);
+
+        assert_eq!(
+            render_attempts(&project),
+            vec![RenderAttempt {
+                colors: 256,
+                high_quality_quantization: false,
+            }]
+        );
+        assert_eq!(
+            palette_filter(&project, "fps=24,scale=800:335"),
+            "fps=24,scale=800:335"
+        );
+    }
+
+    #[test]
+    fn optimize_uses_one_compact_attempt_without_size_target() {
+        let mut project = geometry_test_project();
+        project.settings.gif.colors = 256;
+        project.settings.gif.high_quality_quantization = true;
+        project.settings.gif.optimize = true;
+        project.settings.gif.target_max_bytes = None;
+
+        assert_eq!(
+            render_attempts(&project),
+            vec![RenderAttempt {
+                colors: 256,
+                high_quality_quantization: false,
+            }]
+        );
+    }
+
     fn geometry_test_project() -> Project {
         let mut project = Project::default();
         project.source = Some(MediaSource {
@@ -891,6 +1191,10 @@ mod tests {
             natural_width: Some(800),
             natural_height: Some(400),
             fps: Some(25.0),
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            pixel_format: None,
         });
         let clip = project
             .clips
