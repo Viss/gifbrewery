@@ -19,7 +19,6 @@ use std::thread;
 use std::time::Instant;
 
 const MAX_INTERACTIVE_PREVIEW_EDGE: u32 = 640;
-const MAX_AUTO_PRELOAD_FRAME_PIXELS: u64 = 30_000_000;
 const RENDERED_PLAYBACK_RESCALE_DEBOUNCE_MS: u64 = 2_000;
 
 #[derive(Clone)]
@@ -2448,12 +2447,8 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
         crate::diagnostics::log_line(format_args!(
             "rendered sequence preload skipped on source load: source fps unavailable"
         ));
-    } else if should_auto_preload_rendered_playback(&state.borrow().project) {
-        start_rendered_playback_preload(state, widgets, "source loaded");
     } else {
-        crate::diagnostics::log_line(format_args!(
-            "rendered sequence preload skipped on source load: estimated cache too large"
-        ));
+        start_rendered_playback_preload(state, widgets, "source loaded");
     }
     widgets
         .editor
@@ -4823,34 +4818,6 @@ fn cleanup_stale_preview_cache_dirs() {
 
 fn playback_preload_project(project: &Project) -> Project {
     base_preview_project(project)
-}
-
-fn should_auto_preload_rendered_playback(project: &Project) -> bool {
-    let project = playback_preload_project(project);
-    let Some(fps) = source_frame_fps(&project) else {
-        crate::diagnostics::log_line(format_args!(
-            "rendered sequence preload auto-skip: source fps unavailable"
-        ));
-        return false;
-    };
-    let Some((width, height)) = effective_output_dimensions(&project) else {
-        return false;
-    };
-    let Some(clip) = project.clips.first() else {
-        return false;
-    };
-    let duration = clip.range.duration_seconds().max(0.01);
-    let fps = fps.clamp(1.0, 120.0);
-    let estimated_frame_pixels =
-        u64::from(width) * u64::from(height) * (duration * fps).ceil().max(1.0) as u64;
-    if estimated_frame_pixels > MAX_AUTO_PRELOAD_FRAME_PIXELS {
-        crate::diagnostics::log_line(format_args!(
-            "rendered sequence preload auto-skip estimate: output={}x{} duration={duration:.3}s fps={fps:.1} frame_pixels={estimated_frame_pixels}",
-            width, height
-        ));
-        return false;
-    }
-    true
 }
 
 fn base_preview_project(project: &Project) -> Project {
