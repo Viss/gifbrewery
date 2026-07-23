@@ -328,29 +328,39 @@ fn render_gif_once(
     )?;
     let palette_filter = palette_filter(project, &video_filter);
 
-    let result = run_ffmpeg_command(
-        Command::new("ffmpeg")
-            .arg("-hide_banner")
-            .arg("-y")
-            .arg("-nostats")
-            .arg("-progress")
-            .arg("pipe:2")
-            .arg("-ss")
-            .arg(format!("{:.3}", clip.range.start_seconds))
-            .arg("-t")
-            .arg(format!("{duration:.3}"))
-            .arg("-i")
-            .arg(&source.path)
-            .arg("-filter_complex")
-            .arg(palette_filter)
+    let compact_native_encoder = uses_compact_native_encoder(project);
+    crate::diagnostics::log_line(format_args!(
+        "GIF encoder path: {}",
+        if compact_native_encoder {
+            "compact native (HDR)"
+        } else {
+            "adaptive palette"
+        }
+    ));
+
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-hide_banner")
+        .arg("-y")
+        .arg("-nostats")
+        .arg("-progress")
+        .arg("pipe:2")
+        .arg("-ss")
+        .arg(format!("{:.3}", clip.range.start_seconds))
+        .arg("-t")
+        .arg(format!("{duration:.3}"))
+        .arg("-i")
+        .arg(&source.path)
+        .arg("-filter_complex")
+        .arg(palette_filter);
+    if let Some(global_palette) = gif_global_palette_override(project) {
+        command
             .arg("-global_palette")
-            .arg("0")
-            .arg("-loop")
-            .arg("0")
-            .arg(output_path),
-        duration,
-        Some(progress),
-    );
+            .arg(global_palette.to_string());
+    }
+    command.arg("-loop").arg("0").arg(output_path);
+
+    let result = run_ffmpeg_command(&mut command, duration, Some(progress));
     let _ = fs::remove_dir_all(&text_dir);
 
     result
@@ -679,7 +689,7 @@ fn hdr_to_sdr_filters() -> Vec<String> {
 
 fn palette_filter(project: &Project, video_filter: &str) -> String {
     let colors = project.settings.gif.colors.clamp(2, 256);
-    if project.settings.gif.optimize && !project.settings.gif.high_quality_quantization {
+    if uses_compact_native_encoder(project) {
         return video_filter.to_string();
     }
 
@@ -696,6 +706,16 @@ fn palette_filter(project: &Project, video_filter: &str) -> String {
              [gifbrewery_frames][gifbrewery_palette]paletteuse=dither=none"
         )
     }
+}
+
+fn uses_compact_native_encoder(project: &Project) -> bool {
+    project.settings.gif.optimize
+        && !project.settings.gif.high_quality_quantization
+        && source_needs_hdr_conversion(project)
+}
+
+fn gif_global_palette_override(project: &Project) -> Option<u8> {
+    uses_compact_native_encoder(project).then_some(0)
 }
 
 fn drawtext_files(text_dir: &Path, text: &TextOverlay) -> Result<Vec<(usize, PathBuf)>, String> {
@@ -970,8 +990,9 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_fps, gif_loop_count, palette_filter, render_attempts, source_needs_hdr_conversion,
-        video_filter, RenderAttempt, RenderGeometry,
+        export_fps, gif_global_palette_override, gif_loop_count, palette_filter, render_attempts,
+        source_needs_hdr_conversion, uses_compact_native_encoder, video_filter, RenderAttempt,
+        RenderGeometry,
     };
     use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
 
@@ -1149,6 +1170,10 @@ mod tests {
     #[test]
     fn optimized_export_uses_compact_native_gif_encoder() {
         let mut project = geometry_test_project();
+        let source = project.source.as_mut().expect("test project has source");
+        source.color_space = Some("bt2020nc".to_string());
+        source.color_transfer = Some("smpte2084".to_string());
+        source.color_primaries = Some("bt2020".to_string());
         project.settings.gif.optimize = true;
         project.settings.gif.high_quality_quantization = false;
         project.settings.gif.target_max_bytes = Some(16 * 1024 * 1024);
@@ -1164,6 +1189,23 @@ mod tests {
             palette_filter(&project, "fps=24,scale=800:335"),
             "fps=24,scale=800:335"
         );
+        assert!(uses_compact_native_encoder(&project));
+        assert_eq!(gif_global_palette_override(&project), Some(0));
+    }
+
+    #[test]
+    fn optimized_sdr_export_uses_adaptive_palette_without_dithering() {
+        let mut project = geometry_test_project();
+        project.settings.gif.optimize = true;
+        project.settings.gif.high_quality_quantization = false;
+
+        let filter = palette_filter(&project, "fps=24,scale=800:335");
+
+        assert!(!uses_compact_native_encoder(&project));
+        assert_eq!(gif_global_palette_override(&project), None);
+        assert!(filter.contains("palettegen=max_colors=256"));
+        assert!(filter.contains("paletteuse=dither=none"));
+        assert!(!filter.contains("stats_mode=single"));
     }
 
     #[test]
