@@ -20,6 +20,8 @@ Depends:
  ${shlibs:Depends},
  ${misc:Depends},
  ffmpeg,
+ gifsicle,
+ imagemagick,
  gstreamer1.0-plugins-base,
  gstreamer1.0-plugins-good,
  gstreamer1.0-plugins-bad,
@@ -28,4 +30,3 @@ Depends:
  xdg-desktop-portal
 Description: Native GNOME GIF editor
  A native GTK 4/libadwaita GIF editor inspired by GIF Brewery 3.
-

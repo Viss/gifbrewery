@@ -36,7 +36,8 @@ where
         .settings
         .gif
         .target_max_bytes
-        .filter(|bytes| *bytes > 0);
+        .filter(|bytes| *bytes > 0)
+        .or_else(|| uses_frame_optimized_hdr_encoder(project).then_some(16 * 1024 * 1024));
     let attempts = render_attempts(project);
     let mut final_size = 0;
     let mut final_attempt = None;
@@ -69,7 +70,7 @@ where
             attempt.high_quality_quantization,
             target_max_bytes
         ));
-        render_gif_once(
+        let effective_colors = render_gif_once(
             &attempt_project,
             output_path,
             attempt_clip,
@@ -77,6 +78,10 @@ where
             geometry,
             &progress,
         )?;
+        let actual_attempt = RenderAttempt {
+            colors: effective_colors,
+            high_quality_quantization: attempt.high_quality_quantization,
+        };
         let size = fs::metadata(output_path)
             .map_err(|err| format!("failed to inspect exported GIF size: {err}"))?
             .len();
@@ -86,11 +91,11 @@ where
             size,
             geometry.output_width,
             geometry.output_height,
-            attempt.colors,
-            attempt.high_quality_quantization
+            actual_attempt.colors,
+            actual_attempt.high_quality_quantization
         ));
         final_size = size;
-        final_attempt = Some(*attempt);
+        final_attempt = Some(actual_attempt);
 
         if target_max_bytes.is_none_or(|target| size <= target) {
             break;
@@ -312,7 +317,7 @@ fn render_gif_once(
     fps: u32,
     geometry: RenderGeometry,
     progress: &dyn Fn(ExportProgress),
-) -> Result<(), String> {
+) -> Result<u16, String> {
     let duration = clip.range.duration_seconds().max(0.01);
     let source = project
         .source
@@ -326,18 +331,32 @@ fn render_gif_once(
         geometry,
         &text_dir,
     )?;
-    let palette_filter = palette_filter(project, &video_filter);
 
-    let compact_native_encoder = uses_compact_native_encoder(project);
+    let frame_optimized_hdr = uses_frame_optimized_hdr_encoder(project);
     crate::diagnostics::log_line(format_args!(
         "GIF encoder path: {}",
-        if compact_native_encoder {
-            "compact native (HDR)"
+        if frame_optimized_hdr {
+            "frame-optimized (HDR)"
         } else {
             "adaptive palette"
         }
     ));
 
+    if frame_optimized_hdr {
+        let result = render_frame_optimized_hdr_gif(
+            project,
+            output_path,
+            clip,
+            fps,
+            duration,
+            &video_filter,
+            progress,
+        );
+        let _ = fs::remove_dir_all(&text_dir);
+        return result;
+    }
+
+    let palette_filter = palette_filter(project, &video_filter);
     let mut command = Command::new("ffmpeg");
     command
         .arg("-hide_banner")
@@ -353,17 +372,247 @@ fn render_gif_once(
         .arg(&source.path)
         .arg("-filter_complex")
         .arg(palette_filter);
-    if let Some(global_palette) = gif_global_palette_override(project) {
-        command
-            .arg("-global_palette")
-            .arg(global_palette.to_string());
-    }
     command.arg("-loop").arg("0").arg(output_path);
 
     let result = run_ffmpeg_command(&mut command, duration, Some(progress));
     let _ = fs::remove_dir_all(&text_dir);
 
-    result
+    result.map(|()| project.settings.gif.colors.clamp(2, 256))
+}
+
+fn render_frame_optimized_hdr_gif(
+    project: &Project,
+    output_path: &Path,
+    clip: &Clip,
+    fps: u32,
+    duration: f64,
+    video_filter: &str,
+    progress: &dyn Fn(ExportProgress),
+) -> Result<u16, String> {
+    let source = project
+        .source
+        .as_ref()
+        .ok_or_else(|| "project has no source media".to_string())?;
+    let frame_dir = frame_sequence_temp_dir("gifbrewery-hdr-export")?;
+    let frame_pattern = frame_dir.join("frame-%06d.png");
+
+    progress(ExportProgress {
+        percent: Some(0),
+        message: "Rendering color-corrected GIF frames...".to_string(),
+    });
+    let render_result = run_ffmpeg_command(
+        Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-y")
+            .arg("-nostats")
+            .arg("-progress")
+            .arg("pipe:2")
+            .arg("-ss")
+            .arg(format!("{:.3}", clip.range.start_seconds))
+            .arg("-t")
+            .arg(format!("{duration:.3}"))
+            .arg("-i")
+            .arg(&source.path)
+            .arg("-filter_complex")
+            .arg(video_filter)
+            .arg("-start_number")
+            .arg("0")
+            .arg(&frame_pattern),
+        duration,
+        Some(progress),
+    );
+    if let Err(err) = render_result {
+        let _ = fs::remove_dir_all(&frame_dir);
+        return Err(err);
+    }
+
+    let mut frames = fs::read_dir(&frame_dir)
+        .map_err(|err| {
+            format!(
+                "failed to read HDR export frames in {}: {err}",
+                frame_dir.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "png"))
+        .collect::<Vec<_>>();
+    frames.sort();
+    if frames.is_empty() {
+        let _ = fs::remove_dir_all(&frame_dir);
+        return Err("HDR export produced no frames".to_string());
+    }
+
+    let image_magick = image_magick_command().ok_or_else(|| {
+        "optimized HDR export requires ImageMagick (`magick` or `convert`)".to_string()
+    })?;
+    let target_max_bytes = project
+        .settings
+        .gif
+        .target_max_bytes
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(16 * 1024 * 1024);
+    crate::diagnostics::log_line(format_args!(
+        "HDR frame optimizer: frames={} fps={} requested_colors={} target={} imagemagick={}",
+        frames.len(),
+        fps,
+        project.settings.gif.colors,
+        target_max_bytes,
+        image_magick
+    ));
+
+    let mut effective_colors = project.settings.gif.colors.clamp(2, 256);
+    let mut final_size = 0;
+    for colors in hdr_palette_attempts(effective_colors) {
+        progress(ExportProgress {
+            percent: Some(99),
+            message: format!("Optimizing GIF with {colors} colors..."),
+        });
+        assemble_frame_optimized_gif(image_magick, &frames, fps, colors, output_path)?;
+        optimize_gif_with_gifsicle(output_path, colors);
+        final_size = fs::metadata(output_path)
+            .map_err(|err| format!("failed to inspect optimized HDR GIF: {err}"))?
+            .len();
+        effective_colors = colors;
+        crate::diagnostics::log_line(format_args!(
+            "HDR palette attempt complete: colors={} size={} target={}",
+            colors, final_size, target_max_bytes
+        ));
+        if final_size <= target_max_bytes {
+            break;
+        }
+    }
+
+    if final_size > target_max_bytes {
+        crate::diagnostics::log_line(format_args!(
+            "HDR palette target not met: colors={} size={} target={}",
+            effective_colors, final_size, target_max_bytes
+        ));
+    }
+    let _ = fs::remove_dir_all(&frame_dir);
+    Ok(effective_colors)
+}
+
+fn hdr_palette_attempts(requested_colors: u16) -> Vec<u16> {
+    let requested_colors = requested_colors.clamp(2, 256);
+    let mut attempts = vec![requested_colors];
+    for colors in [192, 128, 96, 64, 48, 32, 24, 16] {
+        if colors < requested_colors && !attempts.contains(&colors) {
+            attempts.push(colors);
+        }
+    }
+    attempts
+}
+
+fn assemble_frame_optimized_gif(
+    image_magick: &str,
+    frames: &[PathBuf],
+    fps: u32,
+    colors: u16,
+    output_path: &Path,
+) -> Result<(), String> {
+    let fuzz_percent = if colors <= 85 {
+        3
+    } else if colors <= 172 {
+        2
+    } else {
+        1
+    };
+    let mut command = Command::new(image_magick);
+    command.arg("-quiet");
+    for (index, frame) in frames.iter().enumerate() {
+        command
+            .arg("-delay")
+            .arg(gif_frame_delay_centiseconds(index, fps).to_string())
+            .arg(frame);
+    }
+    command
+        .arg("+dither")
+        .arg("-colors")
+        .arg(colors.to_string())
+        .arg("-fuzz")
+        .arg(format!("{fuzz_percent}%"))
+        .arg("-layers")
+        .arg("OptimizeFrame")
+        .arg("-layers")
+        .arg("OptimizeTransparency")
+        .arg("-loop")
+        .arg("0")
+        .arg("+map")
+        .arg("-set")
+        .arg("colorspace")
+        .arg("sRGB")
+        .arg(output_path);
+    run_simple_command(&mut command, "ImageMagick GIF assembly")
+}
+
+fn image_magick_command() -> Option<&'static str> {
+    ["magick", "convert"].into_iter().find(|command| {
+        Command::new(command)
+            .arg("-version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+}
+
+fn gif_frame_delay_centiseconds(frame_index: usize, fps: u32) -> u32 {
+    let fps = u64::from(fps.max(1));
+    let frame_index = frame_index as u64;
+    let rounded_timestamp = |index: u64| (index * 100 + fps / 2) / fps;
+    (rounded_timestamp(frame_index + 1) - rounded_timestamp(frame_index)).max(1) as u32
+}
+
+fn optimize_gif_with_gifsicle(output_path: &Path, colors: u16) {
+    let available = Command::new("gifsicle")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        crate::diagnostics::log_line(format_args!(
+            "gifsicle not found; keeping ImageMagick-optimized GIF"
+        ));
+        return;
+    }
+
+    let optimized_path = output_path.with_extension("gifbrewery-optimized.gif");
+    let mut command = Command::new("gifsicle");
+    command
+        .arg("-O3")
+        .arg("--colors")
+        .arg(colors.to_string())
+        .arg(output_path)
+        .arg("-o")
+        .arg(&optimized_path);
+    match run_simple_command(&mut command, "gifsicle optimization") {
+        Ok(()) => {
+            if let Err(err) = fs::rename(&optimized_path, output_path) {
+                crate::diagnostics::log_line(format_args!(
+                    "failed to install gifsicle output: {err}"
+                ));
+                let _ = fs::remove_file(&optimized_path);
+            }
+        }
+        Err(err) => {
+            crate::diagnostics::log_line(format_args!("{err}"));
+            let _ = fs::remove_file(&optimized_path);
+        }
+    }
+}
+
+fn run_simple_command(command: &mut Command, label: &str) -> Result<(), String> {
+    command.stdin(Stdio::null());
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to run {label}: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "{label} failed with status {}: {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
 fn run_ffmpeg_command(
@@ -439,11 +688,15 @@ fn run_ffmpeg_command(
 }
 
 fn drawtext_temp_dir() -> Result<PathBuf, String> {
+    frame_sequence_temp_dir("gifbrewery-drawtext")
+}
+
+fn frame_sequence_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("system clock error while preparing text overlays: {err}"))?;
+        .map_err(|err| format!("system clock error while preparing temporary files: {err}"))?;
     let path = std::env::temp_dir().join(format!(
-        "gifbrewery-drawtext-{}-{}",
+        "{prefix}-{}-{}",
         std::process::id(),
         now.as_nanos()
     ));
@@ -689,10 +942,6 @@ fn hdr_to_sdr_filters() -> Vec<String> {
 
 fn palette_filter(project: &Project, video_filter: &str) -> String {
     let colors = project.settings.gif.colors.clamp(2, 256);
-    if uses_compact_native_encoder(project) {
-        return video_filter.to_string();
-    }
-
     if project.settings.gif.high_quality_quantization {
         format!(
             "{video_filter},split[gifbrewery_palette_src][gifbrewery_frames];\
@@ -708,14 +957,10 @@ fn palette_filter(project: &Project, video_filter: &str) -> String {
     }
 }
 
-fn uses_compact_native_encoder(project: &Project) -> bool {
+fn uses_frame_optimized_hdr_encoder(project: &Project) -> bool {
     project.settings.gif.optimize
         && !project.settings.gif.high_quality_quantization
         && source_needs_hdr_conversion(project)
-}
-
-fn gif_global_palette_override(project: &Project) -> Option<u8> {
-    uses_compact_native_encoder(project).then_some(0)
 }
 
 fn drawtext_files(text_dir: &Path, text: &TextOverlay) -> Result<Vec<(usize, PathBuf)>, String> {
@@ -990,9 +1235,9 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        export_fps, gif_global_palette_override, gif_loop_count, palette_filter, render_attempts,
-        source_needs_hdr_conversion, uses_compact_native_encoder, video_filter, RenderAttempt,
-        RenderGeometry,
+        export_fps, gif_frame_delay_centiseconds, gif_loop_count, hdr_palette_attempts,
+        palette_filter, render_attempts, source_needs_hdr_conversion,
+        uses_frame_optimized_hdr_encoder, video_filter, RenderAttempt, RenderGeometry,
     };
     use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
 
@@ -1168,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn optimized_export_uses_compact_native_gif_encoder() {
+    fn optimized_hdr_export_uses_frame_optimizer() {
         let mut project = geometry_test_project();
         let source = project.source.as_mut().expect("test project has source");
         source.color_space = Some("bt2020nc".to_string());
@@ -1185,12 +1430,7 @@ mod tests {
                 high_quality_quantization: false,
             }]
         );
-        assert_eq!(
-            palette_filter(&project, "fps=24,scale=800:335"),
-            "fps=24,scale=800:335"
-        );
-        assert!(uses_compact_native_encoder(&project));
-        assert_eq!(gif_global_palette_override(&project), Some(0));
+        assert!(uses_frame_optimized_hdr_encoder(&project));
     }
 
     #[test]
@@ -1201,15 +1441,14 @@ mod tests {
 
         let filter = palette_filter(&project, "fps=24,scale=800:335");
 
-        assert!(!uses_compact_native_encoder(&project));
-        assert_eq!(gif_global_palette_override(&project), None);
+        assert!(!uses_frame_optimized_hdr_encoder(&project));
         assert!(filter.contains("palettegen=max_colors=256"));
         assert!(filter.contains("paletteuse=dither=none"));
         assert!(!filter.contains("stats_mode=single"));
     }
 
     #[test]
-    fn optimize_uses_one_compact_attempt_without_size_target() {
+    fn optimize_uses_one_size_focused_attempt_without_target() {
         let mut project = geometry_test_project();
         project.settings.gif.colors = 256;
         project.settings.gif.high_quality_quantization = true;
@@ -1223,6 +1462,26 @@ mod tests {
                 high_quality_quantization: false,
             }]
         );
+    }
+
+    #[test]
+    fn gif_frame_delays_preserve_24_fps_duration() {
+        let delays = (0..24)
+            .map(|index| gif_frame_delay_centiseconds(index, 24))
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays.iter().sum::<u32>(), 100);
+        assert!(delays.iter().all(|delay| matches!(delay, 4 | 5)));
+    }
+
+    #[test]
+    fn hdr_palette_attempts_start_at_requested_quality() {
+        assert_eq!(
+            hdr_palette_attempts(256),
+            vec![256, 192, 128, 96, 64, 48, 32, 24, 16]
+        );
+        assert_eq!(hdr_palette_attempts(100), vec![100, 96, 64, 48, 32, 24, 16]);
+        assert_eq!(hdr_palette_attempts(48), vec![48, 32, 24, 16]);
     }
 
     fn geometry_test_project() -> Project {

@@ -75,6 +75,13 @@ pub fn runtime_issues(gstreamer_ready: bool) -> Vec<String> {
         );
     }
 
+    if !command_available("magick") && !command_available("convert") {
+        issues.push(
+            "Missing ImageMagick. Install the imagemagick package for compact HDR GIF export."
+                .to_string(),
+        );
+    }
+
     if !gstreamer_ready {
         issues.push(
             "GStreamer did not initialize. Install GStreamer runtime libraries and plugins."
