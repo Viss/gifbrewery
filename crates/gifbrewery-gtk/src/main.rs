@@ -457,7 +457,19 @@ fn run_preview_compare_smoke(project: &Project, out_dir: &Path) -> Result<(), St
     let diff_png = out_dir.join("overlay-preview-diff.png");
     let manifest = out_dir.join("overlay-preview-compare.txt");
 
-    export::render_frame_png(project, compare_seconds, &preview_png)?;
+    let preview_frames_dir = out_dir.join("playback-cache");
+    let _ = fs::remove_dir_all(&preview_frames_dir);
+    let sequence = export::render_frame_sequence(project, &preview_frames_dir)?;
+    let preview_frame_index = (compare_seconds * sequence.fps).floor() as usize;
+    let preview_frame =
+        &sequence.frames[preview_frame_index.min(sequence.frames.len().saturating_sub(1))];
+    fs::copy(preview_frame, &preview_png).map_err(|err| {
+        format!(
+            "failed to copy cached preview frame {} to {}: {err}",
+            preview_frame.display(),
+            preview_png.display()
+        )
+    })?;
     export::export_gif(project, &export_gif)?;
     extract_gif_frame(&export_gif, compare_seconds, &export_frame)?;
     let rmse = compare_images(&preview_png, &export_frame, &diff_png)?;
@@ -465,7 +477,9 @@ fn run_preview_compare_smoke(project: &Project, out_dir: &Path) -> Result<(), St
     fs::write(
         &manifest,
         format!(
-            "compare_seconds={compare_seconds:.3}\npreview={}\nexport={}\nexport_frame={}\ndiff={}\nrmse={rmse:.6}\n",
+            "compare_seconds={compare_seconds:.3}\npreview_fps={:.6}\npreview_frame_index={}\npreview={}\nexport={}\nexport_frame={}\ndiff={}\nrmse={rmse:.6}\n",
+            sequence.fps,
+            preview_frame_index,
             preview_png.display(),
             export_gif.display(),
             export_frame.display(),
@@ -497,15 +511,13 @@ fn run_crop_playback_smoke(project: &Project, out_dir: &Path) -> Result<(), Stri
     let started = Instant::now();
     let sequence = export::render_frame_sequence(project, &frames_dir)?;
     let render_seconds = started.elapsed().as_secs_f64();
-    let expected_frames = (sequence.duration_seconds * f64::from(sequence.fps))
-        .ceil()
-        .max(1.0) as usize;
+    let expected_frames = (sequence.duration_seconds * sequence.fps).ceil().max(1.0) as usize;
     let frame_count = sequence.frames.len();
     let generated_fps = frame_count as f64 / render_seconds.max(0.001);
-    let frame_budget_ms = 1000.0 / f64::from(sequence.fps.max(1));
-    let first_frame = out_dir.join("crop-playback-first-frame.jpg");
-    let middle_frame = out_dir.join("crop-playback-middle-frame.jpg");
-    let last_frame = out_dir.join("crop-playback-last-frame.jpg");
+    let frame_budget_ms = 1000.0 / sequence.fps.max(1.0);
+    let first_frame = out_dir.join("crop-playback-first-frame.png");
+    let middle_frame = out_dir.join("crop-playback-middle-frame.png");
+    let last_frame = out_dir.join("crop-playback-last-frame.png");
 
     fs::copy(&sequence.frames[0], &first_frame).map_err(|err| {
         format!(

@@ -8,7 +8,7 @@ use gifbrewery_core::{
 };
 use gtk::{cairo, gdk, gio, pango};
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -45,7 +45,6 @@ struct AppState {
     is_playing: bool,
     thumbnails: Vec<crate::timeline::TimelineThumbnail>,
     syncing_widgets: bool,
-    thumbnail_generation: u64,
     rendered_playback_cache: Option<RenderedPlaybackCache>,
     rendered_playback_generation: u64,
     rendered_playback_preparing: bool,
@@ -54,9 +53,11 @@ struct AppState {
     rendered_playback_preload_debounce: u64,
     rendered_playback_start_requested: bool,
     rendered_playback_frame_index: usize,
+    rendered_playback_origin_frame_index: usize,
     rendered_playback_tick: Option<Instant>,
     rendered_playback_started_at: Option<Instant>,
     preview_loop_enabled: bool,
+    overlay_render_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +65,6 @@ struct RenderedPlaybackCache {
     key: String,
     frames: Vec<gdk::Texture>,
     fps: f64,
-    frame_duration_seconds: f64,
     clip_start_seconds: f64,
     clip_end_seconds: f64,
 }
@@ -104,7 +104,12 @@ struct CaptionOverlay {
     active_bounds: Rc<RefCell<Vec<(String, PixelBounds)>>>,
     source_height: Rc<Cell<f64>>,
     exact_preview_aspect: Rc<Cell<f64>>,
-    exact_preview_visible: Rc<Cell<bool>>,
+}
+
+#[derive(Clone)]
+struct CaptionRaster {
+    surface: cairo::ImageSurface,
+    local_bounds: PixelBounds,
 }
 
 #[derive(Clone)]
@@ -159,7 +164,7 @@ impl CaptionOverlay {
         let active_bounds = Rc::new(RefCell::new(Vec::new()));
         let source_height = Rc::new(Cell::new(540.0));
         let exact_preview_aspect = Rc::new(Cell::new(16.0 / 9.0));
-        let exact_preview_visible = Rc::new(Cell::new(false));
+        let raster_cache = Rc::new(RefCell::new(HashMap::new()));
 
         area.set_draw_func({
             let texts = Rc::clone(&texts);
@@ -167,28 +172,24 @@ impl CaptionOverlay {
             let active_bounds = Rc::clone(&active_bounds);
             let source_height = Rc::clone(&source_height);
             let exact_preview_aspect = Rc::clone(&exact_preview_aspect);
-            let exact_preview_visible = Rc::clone(&exact_preview_visible);
+            let raster_cache = Rc::clone(&raster_cache);
             move |_, cr, width, height| {
                 let selected_id = selected_id.borrow().clone();
                 let mut selected_bounds = None;
                 let mut bounds_by_id = Vec::new();
+                let rect = contained_rect(
+                    f64::from(width),
+                    f64::from(height),
+                    exact_preview_aspect.get(),
+                );
                 for text in texts.borrow().iter() {
-                    let bounds = if exact_preview_visible.get() {
-                        let rect = contained_rect(
-                            f64::from(width),
-                            f64::from(height),
-                            exact_preview_aspect.get(),
-                        );
-                        draw_caption_overlay_in_rect(cr, rect, source_height.get(), text)
-                    } else {
-                        draw_caption_overlay(
-                            cr,
-                            f64::from(width),
-                            f64::from(height),
-                            source_height.get(),
-                            text,
-                        )
-                    };
+                    let bounds = draw_cached_caption_overlay(
+                        cr,
+                        rect,
+                        source_height.get(),
+                        text,
+                        &raster_cache,
+                    );
                     bounds_by_id.push((text.id.clone(), bounds));
                     if selected_id.as_deref() == Some(text.id.as_str()) {
                         selected_bounds = Some(bounds);
@@ -208,7 +209,6 @@ impl CaptionOverlay {
             active_bounds,
             source_height,
             exact_preview_aspect,
-            exact_preview_visible,
         }
     }
 
@@ -261,8 +261,7 @@ impl CaptionOverlay {
         self.area.queue_draw();
     }
 
-    fn set_exact_preview_visible(&self, visible: bool) {
-        self.exact_preview_visible.set(visible);
+    fn set_exact_preview_visible(&self, _visible: bool) {
         self.area.queue_draw();
     }
 }
@@ -316,6 +315,7 @@ struct InspectorWidgets {
     clip_end: adw::SpinRow,
     clip_mark_start: gtk::Button,
     clip_mark_end: gtk::Button,
+    clip_trim_selection: gtk::Button,
     clip_speed: adw::SpinRow,
     clip_fps: adw::SpinRow,
     target_size_enabled: adw::SwitchRow,
@@ -357,7 +357,6 @@ pub fn build_main_window(app: &adw::Application) -> AppHandle {
         is_playing: false,
         thumbnails: Vec::new(),
         syncing_widgets: false,
-        thumbnail_generation: 0,
         rendered_playback_cache: None,
         rendered_playback_generation: 0,
         rendered_playback_preparing: false,
@@ -366,9 +365,11 @@ pub fn build_main_window(app: &adw::Application) -> AppHandle {
         rendered_playback_preload_debounce: 0,
         rendered_playback_start_requested: false,
         rendered_playback_frame_index: 0,
+        rendered_playback_origin_frame_index: 0,
         rendered_playback_tick: None,
         rendered_playback_started_at: None,
         preview_loop_enabled: false,
+        overlay_render_dirty: false,
     }));
 
     let project = state.borrow().project.clone();
@@ -724,6 +725,7 @@ fn build_inspector(project: &Project) -> (gtk::Box, InspectorWidgets) {
             clip_end: clip_widgets.end,
             clip_mark_start: clip_widgets.mark_start,
             clip_mark_end: clip_widgets.mark_end,
+            clip_trim_selection: clip_widgets.trim_selection,
             clip_speed: clip_widgets.speed,
             clip_fps: clip_widgets.fps,
             target_size_enabled: gif_widgets.target_size_enabled,
@@ -762,6 +764,7 @@ struct ClipInspectorWidgets {
     end: adw::SpinRow,
     mark_start: gtk::Button,
     mark_end: gtk::Button,
+    trim_selection: gtk::Button,
     speed: adw::SpinRow,
     fps: adw::SpinRow,
 }
@@ -800,6 +803,16 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
         .valign(gtk::Align::Center)
         .build();
     group.add(&action_row_with_suffix("End at Playhead", &mark_end));
+    let trim_selection = gtk::Button::builder()
+        .label("Trim to Selection")
+        .icon_name("edit-cut-symbolic")
+        .tooltip_text("Discard frames outside the selected start and end")
+        .valign(gtk::Align::Center)
+        .build();
+    group.add(&action_row_with_suffix(
+        "Keep Selected Frames",
+        &trim_selection,
+    ));
     let speed = spin_row("Speed", clip.speed, 0.05, 8.0, 0.05);
     speed.set_sensitive(false);
     group.add(&speed);
@@ -825,6 +838,7 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
             end,
             mark_start,
             mark_end,
+            trim_selection,
             speed,
             fps,
         },
@@ -1774,6 +1788,12 @@ fn install_widget_bindings(
         move |_| mark_clip_end_at_playhead(&state, &widgets)
     });
 
+    widgets.inspector.clip_trim_selection.connect_clicked({
+        let state = Rc::clone(state);
+        let widgets = widgets.clone();
+        move |_| trim_to_clip_selection(&state, &widgets)
+    });
+
     widgets
         .inspector
         .target_size_enabled
@@ -2334,11 +2354,6 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
             None
         }
     };
-    let thumbnail_source = path.as_ref().zip(
-        metadata
-            .as_ref()
-            .and_then(|metadata| metadata.duration_seconds),
-    );
     let display_path = path
         .as_ref()
         .map(|path| path.display().to_string())
@@ -2383,11 +2398,13 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
         });
         state.playhead_seconds = 0.0;
         state.thumbnails = Vec::new();
-        state.thumbnail_generation = state.thumbnail_generation.wrapping_add(1);
         invalidate_render_outputs(&mut state);
 
         if let (Some(clip), Some(source_fps)) = (state.project.clips.first_mut(), source_fps) {
             clip.frame_strategy = FrameStrategy::Fps(source_fps.round().clamp(1.0, 120.0) as u32);
+        }
+        if let Some(clip) = state.project.clips.first_mut() {
+            clip.source_offset_seconds = 0.0;
         }
 
         if let Some(duration_seconds) = duration_seconds {
@@ -2433,9 +2450,6 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
         caption.area.set_visible(true);
     }
     update_timeline_widgets(state, widgets);
-    if let Some((path, duration)) = thumbnail_source {
-        start_thumbnail_worker(state, widgets, path.to_path_buf(), duration);
-    }
     let can_render_source = source_frame_fps(&state.borrow().project).is_some();
     if !can_render_source {
         widgets
@@ -2454,45 +2468,6 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
         .editor
         .export_button
         .set_sensitive(can_render_source);
-}
-
-fn start_thumbnail_worker(
-    state: &Rc<RefCell<AppState>>,
-    widgets: &AppWidgets,
-    path: PathBuf,
-    duration: f64,
-) {
-    let generation = state.borrow().thumbnail_generation;
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let started = Instant::now();
-        let thumbnails = thumbnails::extract_thumbnail_files(&path, duration, 12);
-        let elapsed = started.elapsed().as_secs_f64();
-        let _ = sender.send((generation, thumbnails, elapsed));
-    });
-
-    let receiver = Rc::new(RefCell::new(receiver));
-    let state = Rc::clone(state);
-    let widgets = widgets.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
-        let Ok((generation, thumbnails, elapsed)) = receiver.borrow_mut().try_recv() else {
-            return glib::ControlFlow::Continue;
-        };
-        if state.borrow().thumbnail_generation == generation {
-            let thumbnails = thumbnails::load_thumbnail_pixbufs(&thumbnails);
-            crate::diagnostics::log_line(format_args!(
-                "timeline thumbnails ready: count={} elapsed={elapsed:.3}s",
-                thumbnails.len()
-            ));
-            state.borrow_mut().thumbnails = thumbnails;
-            update_timeline_widgets(&state, &widgets);
-        } else {
-            crate::diagnostics::log_line(format_args!(
-                "discarded stale timeline thumbnails: generation={generation}"
-            ));
-        }
-        glib::ControlFlow::Break
-    });
 }
 
 fn start_rendered_playback_preload(
@@ -2532,8 +2507,8 @@ fn start_rendered_playback_preload(
             ));
             return;
         }
+        let cache_key = rendered_playback_cache_key(&state.project);
         let project = playback_preload_project(&state.project);
-        let cache_key = rendered_playback_cache_key(&project);
         if state
             .rendered_playback_cache
             .as_ref()
@@ -2566,10 +2541,14 @@ fn start_rendered_playback_preload(
         "rendered sequence preload started: reason={reason} key={cache_key}"
     ));
 
+    let (rendered_source_start, rendered_source_duration) = retained_source_interval(&project);
+
     let (sender, receiver) = mpsc::channel::<(
         u64,
         String,
         PathBuf,
+        f64,
+        f64,
         Result<crate::export::RenderedFrameSequence, String>,
     )>();
     thread::spawn({
@@ -2583,7 +2562,14 @@ fn start_rendered_playback_preload(
                 "rendered sequence preload worker finished in {:.3}s",
                 started.elapsed().as_secs_f64()
             ));
-            let _ = sender.send((generation, cache_key, output_dir, result));
+            let _ = sender.send((
+                generation,
+                cache_key,
+                output_dir,
+                rendered_source_start,
+                rendered_source_duration,
+                result,
+            ));
         }
     });
 
@@ -2591,13 +2577,19 @@ fn start_rendered_playback_preload(
     let state = Rc::clone(state);
     let widgets = widgets.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
-        let Ok((generation, cache_key, output_dir, result)) = receiver.borrow_mut().try_recv()
+        let Ok((
+            generation,
+            cache_key,
+            output_dir,
+            rendered_source_start,
+            rendered_source_duration,
+            result,
+        )) = receiver.borrow_mut().try_recv()
         else {
             return glib::ControlFlow::Continue;
         };
 
-        let current_key =
-            rendered_playback_cache_key(&playback_preload_project(&state.borrow().project));
+        let current_key = rendered_playback_cache_key(&state.borrow().project);
         let is_current =
             state.borrow().rendered_playback_generation == generation && current_key == cache_key;
         if !is_current {
@@ -2622,8 +2614,32 @@ fn start_rendered_playback_preload(
 
         match result {
             Ok(sequence) => {
-                let frame_count = sequence.frames.len();
-                let textures = match load_rendered_playback_textures(&sequence.frames) {
+                let (current_source_start, current_source_duration) =
+                    retained_source_interval(&state.borrow().project);
+                let Some(frame_paths) = slice_textures_for_source_interval(
+                    sequence.frames,
+                    sequence.fps,
+                    rendered_source_start,
+                    rendered_source_duration,
+                    current_source_start,
+                    current_source_duration,
+                ) else {
+                    {
+                        let mut state = state.borrow_mut();
+                        state.rendered_playback_preparing = false;
+                        state.rendered_playback_rebuild_requested = false;
+                    }
+                    crate::diagnostics::log_line(format_args!(
+                        "rendered sequence preload interval no longer covers retained source"
+                    ));
+                    start_rendered_playback_preload(
+                        &state,
+                        &widgets,
+                        "retained source interval changed",
+                    );
+                    return glib::ControlFlow::Break;
+                };
+                let textures = match load_rendered_playback_textures(&frame_paths) {
                     Ok(textures) => textures,
                     Err(err) => {
                         let was_requested = state.borrow().rendered_playback_start_requested;
@@ -2648,6 +2664,9 @@ fn start_rendered_playback_preload(
                         return glib::ControlFlow::Break;
                     }
                 };
+                let timeline_thumbnails =
+                    timeline_thumbnails_from_frame_paths(&frame_paths, sequence.fps, 12);
+                let frame_count = textures.len();
                 let clip_range = state
                     .borrow()
                     .project
@@ -2661,21 +2680,29 @@ fn start_rendered_playback_preload(
                 let should_start_when_ready = state.borrow().rendered_playback_start_requested;
                 {
                     let mut state = state.borrow_mut();
+                    state.thumbnails = timeline_thumbnails;
                     state.rendered_playback_cache = Some(RenderedPlaybackCache {
                         key: cache_key.clone(),
                         frames: textures,
-                        fps: f64::from(sequence.fps),
-                        frame_duration_seconds: 1.0 / f64::from(sequence.fps.max(1)),
-                        clip_start_seconds: clip_range.start_seconds,
-                        clip_end_seconds: clip_range.end_seconds,
+                        fps: sequence.fps,
+                        clip_start_seconds: 0.0,
+                        clip_end_seconds: current_source_duration,
                     });
                     state.rendered_playback_preparing = false;
                     state.rendered_playback_rebuild_requested = false;
                     if should_start_when_ready {
+                        let start_seconds = playback_start_seconds(
+                            state.playhead_seconds,
+                            clip_range,
+                            sequence.fps,
+                        );
+                        let frame_index =
+                            playback_frame_index(start_seconds, 0.0, sequence.fps, frame_count);
                         state.rendered_playback_start_requested = false;
                         state.is_playing = true;
-                        state.rendered_playback_frame_index = 0;
-                        state.playhead_seconds = clip_range.start_seconds;
+                        state.rendered_playback_frame_index = frame_index;
+                        state.rendered_playback_origin_frame_index = frame_index;
+                        state.playhead_seconds = start_seconds;
                         state.rendered_playback_tick = None;
                         state.rendered_playback_started_at = Some(Instant::now());
                     }
@@ -2703,9 +2730,15 @@ fn start_rendered_playback_preload(
                 crate::diagnostics::log_line(format_args!(
                     "rendered sequence textures ready: frames={frame_count}"
                 ));
+                crate::diagnostics::log_line(format_args!(
+                    "timeline thumbnails sampled from frame cache: count={}",
+                    state.borrow().thumbnails.len()
+                ));
                 if should_start_when_ready {
                     crate::diagnostics::log_line(format_args!(
-                        "rendered sequence playback auto-started after cache ready"
+                        "rendered sequence playback auto-started after cache ready: playhead={:.3}s frame={}",
+                        state.borrow().playhead_seconds,
+                        state.borrow().rendered_playback_origin_frame_index
                     ));
                 }
                 update_timeline_widgets(&state, &widgets);
@@ -2745,6 +2778,29 @@ fn load_rendered_playback_textures(paths: &[PathBuf]) -> Result<Vec<gdk::Texture
                 .map_err(|err| format!("failed to decode {}: {err}", path.display()))
         })
         .collect()
+}
+
+fn timeline_thumbnails_from_frame_paths(
+    paths: &[PathBuf],
+    fps: f64,
+    target_count: usize,
+) -> Vec<crate::timeline::TimelineThumbnail> {
+    if paths.is_empty() || target_count == 0 {
+        return Vec::new();
+    }
+    let count = target_count.min(paths.len());
+    let files = (0..count)
+        .map(|index| {
+            let frame_index = ((index as f64 + 0.5) * paths.len() as f64 / count as f64)
+                .floor()
+                .min(paths.len().saturating_sub(1) as f64) as usize;
+            thumbnails::ThumbnailFile {
+                timestamp_seconds: frame_index as f64 / fps.max(1.0),
+                path: paths[frame_index].clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    thumbnails::load_thumbnail_pixbufs(&files)
 }
 
 fn export_current_gif(
@@ -3166,7 +3222,7 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
         {
             state.playhead_seconds = clip_range.start_seconds;
         }
-        let cache_key = rendered_playback_cache_key(&playback_preload_project(&state.project));
+        let cache_key = rendered_playback_cache_key(&state.project);
         let cache_ready = state
             .rendered_playback_cache
             .as_ref()
@@ -3187,11 +3243,16 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
                 .rendered_playback_cache
                 .as_ref()
                 .map(|cache| {
-                    ((state.playhead_seconds - cache.clip_start_seconds).max(0.0) * cache.fps)
-                        .floor() as usize
+                    playback_frame_index(
+                        state.playhead_seconds,
+                        cache.clip_start_seconds,
+                        cache.fps,
+                        cache.frames.len(),
+                    )
                 })
                 .unwrap_or(0);
             state.rendered_playback_frame_index = frame_index;
+            state.rendered_playback_origin_frame_index = frame_index;
             state.rendered_playback_tick = None;
             state.rendered_playback_started_at = Some(Instant::now());
         }
@@ -3225,7 +3286,17 @@ fn start_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppW
 fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
     let frame_texture = {
         let mut state = state.borrow_mut();
-        let Some(cache) = state.rendered_playback_cache.clone() else {
+        let Some((cache_key, frame_count, cache_fps, cache_start_seconds, cache_end_seconds)) =
+            state.rendered_playback_cache.as_ref().map(|cache| {
+                (
+                    cache.key.clone(),
+                    cache.frames.len(),
+                    cache.fps,
+                    cache.clip_start_seconds,
+                    cache.clip_end_seconds,
+                )
+            })
+        else {
             state.is_playing = false;
             state.rendered_playback_start_requested = false;
             state.rendered_playback_frame_index = 0;
@@ -3233,7 +3304,7 @@ fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWi
             state.rendered_playback_started_at = None;
             return;
         };
-        if cache.key != rendered_playback_cache_key(&playback_preload_project(&state.project)) {
+        if cache_key != rendered_playback_cache_key(&state.project) {
             state.is_playing = false;
             state.rendered_playback_start_requested = false;
             state.rendered_playback_frame_index = 0;
@@ -3245,7 +3316,7 @@ fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWi
             ));
             return;
         }
-        if cache.frames.is_empty() {
+        if frame_count == 0 {
             state.is_playing = false;
             state.rendered_playback_start_requested = false;
             state.rendered_playback_frame_index = 0;
@@ -3253,23 +3324,54 @@ fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWi
             state.rendered_playback_started_at = None;
             return;
         }
+        let clip_range = state
+            .project
+            .clips
+            .first()
+            .map(|clip| clip.range)
+            .unwrap_or(TimelineRange {
+                start_seconds: cache_start_seconds,
+                end_seconds: cache_end_seconds,
+            });
+        let selection_start_frame = playback_frame_index(
+            clip_range.start_seconds,
+            cache_start_seconds,
+            cache_fps,
+            frame_count,
+        );
+        let selection_end_frame = (((clip_range.end_seconds - cache_start_seconds).max(0.0)
+            * cache_fps.max(1.0)
+            - 0.000_001)
+            .ceil() as usize)
+            .clamp(selection_start_frame.saturating_add(1), frame_count);
 
         let now = Instant::now();
-        if state.rendered_playback_frame_index >= cache.frames.len() {
-            let elapsed_wall = state
-                .rendered_playback_started_at
-                .map(|started| now.saturating_duration_since(started).as_secs_f64())
-                .unwrap_or(0.0);
+        let elapsed_wall = state
+            .rendered_playback_started_at
+            .map(|started| now.saturating_duration_since(started).as_secs_f64())
+            .unwrap_or(0.0);
+        let mut scheduled_frame = scheduled_playback_frame(
+            state.rendered_playback_origin_frame_index,
+            elapsed_wall,
+            cache_fps,
+        );
+        if scheduled_frame >= selection_end_frame {
+            let expected_wall = selection_end_frame
+                .saturating_sub(state.rendered_playback_origin_frame_index)
+                as f64
+                / cache_fps.max(1.0);
             if state.preview_loop_enabled {
-                state.rendered_playback_frame_index = 0;
+                state.rendered_playback_frame_index = selection_start_frame;
+                state.rendered_playback_origin_frame_index = selection_start_frame;
                 state.rendered_playback_tick = None;
                 state.rendered_playback_started_at = Some(now);
-                state.playhead_seconds = cache.clip_start_seconds;
+                state.playhead_seconds = clip_range.start_seconds;
+                scheduled_frame = selection_start_frame;
                 crate::diagnostics::log_line(format_args!(
                     "rendered sequence playback loop restart: frames={} expected={:.3}s actual={elapsed_wall:.3}s fps={:.3}",
-                    cache.frames.len(),
-                    cache.clip_end_seconds - cache.clip_start_seconds,
-                    cache.fps
+                    selection_end_frame.saturating_sub(selection_start_frame),
+                    expected_wall,
+                    cache_fps
                 ));
             } else {
                 state.is_playing = false;
@@ -3277,34 +3379,28 @@ fn sync_rendered_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWi
                 state.rendered_playback_frame_index = 0;
                 state.rendered_playback_tick = None;
                 state.rendered_playback_started_at = None;
-                state.playhead_seconds = cache.clip_start_seconds;
+                state.playhead_seconds = clip_range.start_seconds;
                 crate::diagnostics::log_line(format_args!(
                     "rendered sequence playback reached clip end: frames={} expected={:.3}s actual={elapsed_wall:.3}s fps={:.3}",
-                    cache.frames.len(),
-                    cache.clip_end_seconds - cache.clip_start_seconds,
-                    cache.fps
+                    selection_end_frame.saturating_sub(selection_start_frame),
+                    expected_wall,
+                    cache_fps
                 ));
                 return;
             }
         }
-        if state
-            .rendered_playback_tick
-            .is_some_and(|next_due| now < next_due)
-        {
+        if scheduled_frame < state.rendered_playback_frame_index {
             return;
         }
-        let next_due = state.rendered_playback_tick.unwrap_or(now);
-        state.rendered_playback_tick = Some(next_playback_frame_due(
-            now,
-            next_due,
-            cache.frame_duration_seconds,
-        ));
-        let frame_index = state
-            .rendered_playback_frame_index
-            .min(cache.frames.len().saturating_sub(1));
-        let frame_texture = cache.frames[frame_index].clone();
-        state.playhead_seconds = cache.clip_start_seconds
-            + (frame_index as f64 / cache.fps.max(1.0)).min(cache.clip_end_seconds);
+        let frame_index = scheduled_frame.min(selection_end_frame.saturating_sub(1));
+        let frame_texture = state
+            .rendered_playback_cache
+            .as_ref()
+            .expect("rendered playback cache disappeared during playback")
+            .frames[frame_index]
+            .clone();
+        state.playhead_seconds = (cache_start_seconds + frame_index as f64 / cache_fps.max(1.0))
+            .min(clip_range.end_seconds);
         state.rendered_playback_frame_index = frame_index.saturating_add(1);
         frame_texture
     };
@@ -3336,18 +3432,28 @@ fn pause_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
     update_timeline_widgets(state, widgets);
 }
 
-fn next_playback_frame_due(
-    now: Instant,
-    previous_due: Instant,
-    frame_duration_seconds: f64,
-) -> Instant {
-    let frame_duration = std::time::Duration::from_secs_f64(frame_duration_seconds.max(0.001));
-    let next_due = previous_due + frame_duration;
-    if next_due <= now {
-        now + frame_duration
+fn scheduled_playback_frame(origin_frame: usize, elapsed_seconds: f64, fps: f64) -> usize {
+    origin_frame.saturating_add((elapsed_seconds.max(0.0) * fps.max(1.0)).floor() as usize)
+}
+
+fn playback_start_seconds(requested_seconds: f64, clip_range: TimelineRange, fps: f64) -> f64 {
+    let last_frame_seconds =
+        (clip_range.end_seconds - 1.0 / fps.max(1.0)).max(clip_range.start_seconds);
+    if requested_seconds >= clip_range.start_seconds && requested_seconds < clip_range.end_seconds {
+        requested_seconds.min(last_frame_seconds)
     } else {
-        next_due
+        clip_range.start_seconds
     }
+}
+
+fn playback_frame_index(
+    playhead_seconds: f64,
+    clip_start_seconds: f64,
+    fps: f64,
+    frame_count: usize,
+) -> usize {
+    (((playhead_seconds - clip_start_seconds).max(0.0) * fps.max(1.0)).floor() as usize)
+        .min(frame_count.saturating_sub(1))
 }
 
 fn toggle_preview_playback(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
@@ -3427,7 +3533,6 @@ fn update_clip_start_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, 
         }
     }
     update_timeline_widgets(state, widgets);
-    defer_rendered_playback_preload(state, widgets, "clip start updated");
 }
 
 fn update_clip_end_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, end_frame: f64) {
@@ -3447,7 +3552,6 @@ fn update_clip_end_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, en
         }
     }
     update_timeline_widgets(state, widgets);
-    defer_rendered_playback_preload(state, widgets, "clip end updated");
 }
 
 fn mark_clip_start_at_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
@@ -3470,6 +3574,92 @@ fn mark_clip_end_at_playhead(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets
         "clip mark end at playhead: frame={end_frame:.0}"
     ));
     update_clip_end_frame(state, widgets, end_frame);
+}
+
+fn trim_to_clip_selection(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
+    {
+        let mut state = state.borrow_mut();
+        state.is_playing = false;
+        state.rendered_playback_start_requested = false;
+        let selection = state
+            .project
+            .clips
+            .first()
+            .map(|clip| clip.range)
+            .unwrap_or(TimelineRange {
+                start_seconds: 0.0,
+                end_seconds: 0.01,
+            });
+        let old_playhead = state.playhead_seconds;
+        let Some(new_playhead) = state.project.trim_to_clip_selection(old_playhead) else {
+            return;
+        };
+        state.playhead_seconds = new_playhead;
+        if state
+            .selected_overlay_id
+            .as_ref()
+            .is_some_and(|selected_id| {
+                !state.project.overlays.iter().any(|overlay| match overlay {
+                    Overlay::Text(text) => text.id == *selected_id,
+                })
+            })
+        {
+            state.selected_overlay_id =
+                state.project.overlays.first().map(|overlay| match overlay {
+                    Overlay::Text(text) => text.id.clone(),
+                });
+        }
+
+        let old_thumbnail_count = state.thumbnails.len();
+        state.thumbnails.retain_mut(|thumbnail| {
+            if thumbnail.timestamp_seconds < selection.start_seconds
+                || thumbnail.timestamp_seconds > selection.end_seconds
+            {
+                return false;
+            }
+            thumbnail.timestamp_seconds -= selection.start_seconds;
+            true
+        });
+
+        let old_frame_count = state
+            .rendered_playback_cache
+            .as_ref()
+            .map(|cache| cache.frames.len())
+            .unwrap_or(0);
+        if let Some(mut cache) = state.rendered_playback_cache.take() {
+            if let Some(frames) = slice_textures_for_source_interval(
+                cache.frames,
+                cache.fps,
+                cache.clip_start_seconds,
+                cache.clip_end_seconds - cache.clip_start_seconds,
+                selection.start_seconds,
+                selection.duration_seconds(),
+            ) {
+                cache.frames = frames;
+                cache.clip_start_seconds = 0.0;
+                cache.clip_end_seconds = selection.duration_seconds().max(0.01);
+                cache.key = rendered_playback_cache_key(&state.project);
+                state.rendered_playback_cache = Some(cache);
+            }
+        }
+        invalidate_exact_preview_output(&mut state);
+
+        let clip = state.project.clips.first().expect("trimmed clip exists");
+        let duration = clip.range.duration_seconds();
+        let new_frame_count = state
+            .rendered_playback_cache
+            .as_ref()
+            .map(|cache| cache.frames.len())
+            .unwrap_or(0);
+        crate::diagnostics::log_line(format_args!(
+            "trimmed to selection without regeneration: source_offset={:.6}s duration={duration:.6}s overlays={} frames={old_frame_count}->{new_frame_count} thumbnails={old_thumbnail_count}->{}",
+            clip.source_offset_seconds,
+            state.project.overlays.len(),
+            state.thumbnails.len()
+        ));
+    }
+
+    update_timeline_widgets(state, widgets);
 }
 
 fn update_target_size_enabled(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, enabled: bool) {
@@ -3503,7 +3693,6 @@ fn update_clip_fps(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, fps: f64
         let mut state = state.borrow_mut();
         if let Some(clip) = state.project.clips.first_mut() {
             clip.frame_strategy = FrameStrategy::Fps(fps.round().clamp(1.0, 60.0) as u32);
-            invalidate_render_outputs(&mut state);
         }
     }
     update_timeline_widgets(state, widgets);
@@ -3638,7 +3827,6 @@ fn update_clip_range(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, range:
         }
     }
     update_timeline_widgets(state, widgets);
-    defer_rendered_playback_preload(state, widgets, "clip range updated");
 }
 
 fn selected_text_overlay<'a>(
@@ -4587,6 +4775,15 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
     }
 
     state.borrow_mut().syncing_widgets = false;
+    let overlay_render_dirty = {
+        let mut state = state.borrow_mut();
+        std::mem::take(&mut state.overlay_render_dirty)
+    };
+    if overlay_render_dirty {
+        crate::diagnostics::log_line(format_args!(
+            "overlay updated: reused loaded media frame cache"
+        ));
+    }
     refresh_exact_preview_frame(state, widgets);
 }
 
@@ -4656,6 +4853,27 @@ fn refresh_exact_preview_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidge
             let crop = state.project.clips.first().and_then(|clip| clip.crop);
             crop_overlay.set_crop(crop, true);
         }
+        let retain_last_exact_frame = should_retain_last_exact_frame(
+            state.rendered_playback_preparing,
+            state.rendered_playback_preload_deferred,
+            widgets.editor.rendered_frame.paintable().is_some(),
+        );
+        if retain_last_exact_frame {
+            widgets.editor.rendered_frame.set_visible(true);
+            if let Some(crop_overlay) = &widgets.editor.crop_overlay {
+                crop_overlay.set_crop(None, false);
+            }
+            if let Some(caption) = &widgets.editor.caption_overlay {
+                caption.set_exact_preview_visible(true);
+            }
+            widgets
+                .editor
+                .source_title
+                .set_label("Updating preview frame...");
+            widgets.editor.export_status.set_visible(true);
+            widgets.editor.export_status.set_label("Rendering changes");
+            return;
+        }
         if let Some(caption) = &widgets.editor.caption_overlay {
             caption.set_exact_preview_visible(false);
         }
@@ -4682,6 +4900,14 @@ fn refresh_exact_preview_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidge
     }
 }
 
+fn should_retain_last_exact_frame(
+    preparing: bool,
+    preload_deferred: bool,
+    has_paintable: bool,
+) -> bool {
+    has_paintable && (preparing || preload_deferred)
+}
+
 fn display_cached_rendered_frame_for_playhead(
     state: &Rc<RefCell<AppState>>,
     widgets: &AppWidgets,
@@ -4691,7 +4917,7 @@ fn display_cached_rendered_frame_for_playhead(
         if state.is_playing || state.project.source.is_none() {
             return false;
         }
-        let cache_key = rendered_playback_cache_key(&playback_preload_project(&state.project));
+        let cache_key = rendered_playback_cache_key(&state.project);
         let Some(cache) = state.rendered_playback_cache.as_ref() else {
             return false;
         };
@@ -4782,9 +5008,8 @@ fn defer_rendered_playback_preload(
 
 fn invalidate_exact_preview_output(_state: &mut AppState) {}
 
-fn invalidate_overlay_output(_state: &mut AppState) {
-    // Captions are live GTK overlays. Touching, moving, adding, or styling them
-    // must not invalidate ffmpeg-rendered media frames.
+fn invalidate_overlay_output(state: &mut AppState) {
+    state.overlay_render_dirty = true;
 }
 
 fn rendered_playback_sequence_dir(key: &str) -> PathBuf {
@@ -4796,6 +5021,57 @@ fn rendered_playback_sequence_dir(key: &str) -> PathBuf {
             std::process::id()
         ))
         .join(format!("{:016x}", hasher.finish()))
+}
+
+fn retained_source_interval(project: &Project) -> (f64, f64) {
+    let start = project
+        .clips
+        .first()
+        .map(|clip| clip.source_offset_seconds)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let duration = project
+        .source
+        .as_ref()
+        .and_then(|source| source.duration_seconds)
+        .or_else(|| {
+            project
+                .clips
+                .first()
+                .map(|clip| clip.range.duration_seconds())
+        })
+        .unwrap_or(0.01)
+        .max(0.01);
+    (start, duration)
+}
+
+fn slice_textures_for_source_interval<T: Clone>(
+    textures: Vec<T>,
+    fps: f64,
+    rendered_start: f64,
+    rendered_duration: f64,
+    retained_start: f64,
+    retained_duration: f64,
+) -> Option<Vec<T>> {
+    let fps = fps.max(1.0);
+    let frame_tolerance = 1.0 / fps + 0.000_001;
+    let rendered_end = rendered_start + rendered_duration;
+    let retained_end = retained_start + retained_duration;
+    if retained_start < rendered_start - frame_tolerance
+        || retained_end > rendered_end + frame_tolerance
+    {
+        return None;
+    }
+
+    let start_index = ((retained_start - rendered_start).max(0.0) * fps).round() as usize;
+    let retained_frames = (retained_duration * fps - 0.000_001).ceil().max(1.0) as usize;
+    let end_index = start_index
+        .saturating_add(retained_frames)
+        .min(textures.len());
+    if start_index >= end_index {
+        return None;
+    }
+    Some(textures[start_index..end_index].to_vec())
 }
 
 fn cleanup_stale_preview_cache_dirs() {
@@ -4817,7 +5093,17 @@ fn cleanup_stale_preview_cache_dirs() {
 }
 
 fn playback_preload_project(project: &Project) -> Project {
-    base_preview_project(project)
+    let mut project = base_preview_project(project);
+    if let (Some(source), Some(clip)) = (project.source.as_ref(), project.clips.first_mut()) {
+        clip.range = TimelineRange {
+            start_seconds: 0.0,
+            end_seconds: source
+                .duration_seconds
+                .unwrap_or(clip.range.end_seconds)
+                .max(0.01),
+        };
+    }
+    project
 }
 
 fn base_preview_project(project: &Project) -> Project {
@@ -4851,8 +5137,7 @@ fn rendered_playback_cache_key(project: &Project) -> String {
         key.push_str(&source.path);
         key.push(';');
         key.push_str(&format!(
-            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?};",
-            source.duration_seconds,
+            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?};",
             source.natural_width,
             source.natural_height,
             source.fps,
@@ -4863,19 +5148,13 @@ fn rendered_playback_cache_key(project: &Project) -> String {
         ));
     }
     if let Some(clip) = project.clips.first() {
-        key.push_str(&format!(
-            "{:.6}:{:.6}:{:?};",
-            clip.range.start_seconds, clip.range.end_seconds, clip.crop
-        ));
-        key.push_str(&format!("{:?};", clip.frame_strategy));
+        key.push_str(&format!("{:?};", clip.crop));
     }
     key.push_str(&format!(
-        "{:?}:{:?}:{:?}:{:?}:{:?};",
+        "{:?}:{:?}:{:?};",
         project.settings.gif.output_width,
         project.settings.gif.output_height,
-        project.settings.gif.colors,
-        project.settings.gif.high_quality_quantization,
-        project.settings.gif.optimize
+        project.settings.gif.tone_map_hdr
     ));
     key
 }
@@ -5039,21 +5318,92 @@ fn square_stroke_offsets(stroke_width: f64) -> Vec<(f64, f64)> {
     offsets
 }
 
-fn draw_caption_overlay_in_rect(
+fn draw_cached_caption_overlay(
     cr: &cairo::Context,
     rect: PixelBounds,
     source_height: f64,
     text: &TextOverlay,
+    cache: &RefCell<HashMap<String, CaptionRaster>>,
 ) -> PixelBounds {
+    let key = caption_raster_key(rect, source_height, text);
+    let raster = {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 64 && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        if let Some(raster) = cache.get(&key) {
+            raster.clone()
+        } else {
+            let raster = rasterize_caption(rect, source_height, text);
+            cache.insert(key, raster.clone());
+            raster
+        }
+    };
+
+    let bounds = PixelBounds {
+        x: rect.x + text.bounds.x * rect.width + raster.local_bounds.x,
+        y: rect.y + text.bounds.y * rect.height + raster.local_bounds.y,
+        width: raster.local_bounds.width,
+        height: raster.local_bounds.height,
+    };
     let _ = cr.save();
-    cr.rectangle(rect.x, rect.y, rect.width, rect.height);
-    cr.clip();
-    cr.translate(rect.x, rect.y);
-    let mut bounds = draw_caption_overlay(cr, rect.width, rect.height, source_height, text);
+    let _ = cr.set_source_surface(&raster.surface, bounds.x, bounds.y);
+    let _ = cr.paint();
     let _ = cr.restore();
-    bounds.x += rect.x;
-    bounds.y += rect.y;
     bounds
+}
+
+fn caption_raster_key(rect: PixelBounds, source_height: f64, text: &TextOverlay) -> String {
+    let mut style = text.clone();
+    style.bounds.x = 0.0;
+    style.bounds.y = 0.0;
+    format!(
+        "{}x{}:{:.6}:{style:?}",
+        rect.width.round() as i32,
+        rect.height.round() as i32,
+        source_height
+    )
+}
+
+fn rasterize_caption(rect: PixelBounds, source_height: f64, text: &TextOverlay) -> CaptionRaster {
+    let mut local_text = text.clone();
+    local_text.bounds.x = 0.0;
+    local_text.bounds.y = 0.0;
+
+    let measurement_surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1)
+        .expect("create caption measurement surface");
+    let measurement_context =
+        cairo::Context::new(&measurement_surface).expect("create caption measurement context");
+    let (_, _, _, _, local_bounds) = caption_layout(
+        &measurement_context,
+        rect.width,
+        rect.height,
+        source_height,
+        &local_text,
+    );
+    let surface_width = local_bounds.width.ceil().max(1.0) as i32;
+    let surface_height = local_bounds.height.ceil().max(1.0) as i32;
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, surface_width, surface_height)
+        .expect("create caption raster surface");
+    let context = cairo::Context::new(&surface).expect("create caption raster context");
+    context.set_operator(cairo::Operator::Source);
+    context.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    let _ = context.paint();
+    context.set_operator(cairo::Operator::Over);
+    context.translate(-local_bounds.x, -local_bounds.y);
+    draw_caption_overlay(
+        &context,
+        rect.width,
+        rect.height,
+        source_height,
+        &local_text,
+    );
+    surface.flush();
+
+    CaptionRaster {
+        surface,
+        local_bounds,
+    }
 }
 
 fn caption_layout(
@@ -5304,31 +5654,90 @@ mod tests {
     }
 
     #[test]
-    fn playback_due_advances_one_frame_interval() {
-        let start = Instant::now();
-        let frame_duration = 1.0 / 24.0;
-        let due = start + std::time::Duration::from_secs_f64(frame_duration);
-        let now = due + std::time::Duration::from_millis(1);
-        let next = next_playback_frame_due(now, due, frame_duration);
-
-        assert_close(
-            next.saturating_duration_since(due).as_secs_f64(),
-            frame_duration,
-        );
+    fn playback_frame_is_derived_from_wall_clock() {
+        assert_eq!(scheduled_playback_frame(0, 0.0, 30.0), 0);
+        assert_eq!(scheduled_playback_frame(0, 0.034, 30.0), 1);
+        assert_eq!(scheduled_playback_frame(10, 0.100, 30.0), 13);
     }
 
     #[test]
-    fn playback_due_resets_after_large_delay() {
-        let start = Instant::now();
-        let frame_duration = 1.0 / 24.0;
-        let due = start + std::time::Duration::from_secs_f64(frame_duration);
-        let now = due + std::time::Duration::from_millis(200);
-        let next = next_playback_frame_due(now, due, frame_duration);
+    fn playback_skips_stale_frames_after_a_delay() {
+        assert_eq!(scheduled_playback_frame(0, 0.200, 30.0), 6);
+        assert_eq!(scheduled_playback_frame(5, 0.200, 30_000.0 / 1001.0), 10);
+    }
 
-        assert_close(
-            next.saturating_duration_since(now).as_secs_f64(),
-            frame_duration,
-        );
+    #[test]
+    fn pending_playback_preserves_requested_origin_frame() {
+        let clip_range = TimelineRange {
+            start_seconds: 1.0,
+            end_seconds: 4.0,
+        };
+        let start_seconds = playback_start_seconds(2.5, clip_range, 30.0);
+
+        assert_close(start_seconds, 2.5);
+        assert_eq!(playback_frame_index(start_seconds, 1.0, 30.0, 90), 45);
+        assert_close(playback_start_seconds(8.0, clip_range, 30.0), 1.0);
+    }
+
+    #[test]
+    fn overlay_refresh_retains_last_exact_frame_while_replacement_is_pending() {
+        assert!(should_retain_last_exact_frame(false, true, true));
+        assert!(should_retain_last_exact_frame(true, false, true));
+        assert!(!should_retain_last_exact_frame(false, false, true));
+        assert!(!should_retain_last_exact_frame(true, true, false));
+    }
+
+    #[test]
+    fn playback_cache_key_ignores_selection_and_overlays_but_tracks_resize() {
+        let mut project = output_test_project();
+        project.clips[0].range = TimelineRange {
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+        };
+        let original_key = rendered_playback_cache_key(&project);
+
+        project.clips[0].range = TimelineRange {
+            start_seconds: 0.5,
+            end_seconds: 1.5,
+        };
+        project
+            .overlays
+            .push(Overlay::Text(TextOverlay::default_caption()));
+        assert_eq!(rendered_playback_cache_key(&project), original_key);
+
+        project.settings.gif.output_width = Some(800);
+        project.settings.gif.output_height = Some(450);
+        assert_ne!(rendered_playback_cache_key(&project), original_key);
+    }
+
+    #[test]
+    fn playback_preload_covers_retained_source_without_overlays() {
+        let mut project = output_test_project();
+        project.clips[0].source_offset_seconds = 4.0;
+        project.clips[0].range = TimelineRange {
+            start_seconds: 0.5,
+            end_seconds: 1.5,
+        };
+        project
+            .overlays
+            .push(Overlay::Text(TextOverlay::default_caption()));
+
+        let preload = playback_preload_project(&project);
+
+        assert!(preload.overlays.is_empty());
+        assert_close(preload.clips[0].range.start_seconds, 0.0);
+        assert_close(preload.clips[0].range.end_seconds, 2.0);
+        assert_close(preload.clips[0].source_offset_seconds, 4.0);
+    }
+
+    #[test]
+    fn retained_selection_slices_loaded_frames_without_regeneration() {
+        let frames = (0..100).collect::<Vec<_>>();
+
+        let sliced = slice_textures_for_source_interval(frames, 10.0, 2.0, 10.0, 5.0, 3.0)
+            .expect("retained interval should be covered");
+
+        assert_eq!(sliced, (30..60).collect::<Vec<_>>());
     }
 
     #[test]

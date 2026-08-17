@@ -38,6 +38,39 @@ impl Project {
 
         Ok(())
     }
+
+    pub fn trim_to_clip_selection(&mut self, playhead_seconds: f64) -> Option<f64> {
+        let selection = self.clips.first()?.range;
+        let duration = selection.duration_seconds().max(0.01);
+        let selection_start = selection.start_seconds;
+
+        let clip = self.clips.first_mut()?;
+        clip.source_offset_seconds += selection_start;
+        clip.range = TimelineRange {
+            start_seconds: 0.0,
+            end_seconds: duration,
+        };
+        if let Some(source) = self.source.as_mut() {
+            source.duration_seconds = Some(duration);
+        }
+
+        self.overlays.retain_mut(|overlay| match overlay {
+            Overlay::Text(text) => {
+                let start = text.range.start_seconds.max(selection.start_seconds);
+                let end = text.range.end_seconds.min(selection.end_seconds);
+                if end <= start {
+                    return false;
+                }
+                text.range = TimelineRange {
+                    start_seconds: start - selection_start,
+                    end_seconds: end - selection_start,
+                };
+                true
+            }
+        });
+
+        Some((playhead_seconds - selection_start).clamp(0.0, duration))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -61,6 +94,8 @@ pub struct MediaSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Clip {
     pub name: String,
+    #[serde(default)]
+    pub source_offset_seconds: f64,
     pub range: TimelineRange,
     pub frame_strategy: FrameStrategy,
     pub speed: f64,
@@ -72,6 +107,7 @@ impl Default for Clip {
     fn default() -> Self {
         Self {
             name: "Current Clip".to_string(),
+            source_offset_seconds: 0.0,
             range: TimelineRange {
                 start_seconds: 0.0,
                 end_seconds: 3.0,
@@ -291,4 +327,59 @@ pub enum ProjectError {
     NegativeStartTime,
     #[error("timeline end time must be greater than start time")]
     InvalidRange,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trimming_rebases_source_timeline_playhead_and_overlays() {
+        let mut project = Project::default();
+        project.source = Some(MediaSource {
+            path: "source.webm".to_string(),
+            duration_seconds: Some(10.0),
+            natural_width: Some(1280),
+            natural_height: Some(720),
+            fps: Some(30_000.0 / 1001.0),
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            pixel_format: None,
+        });
+        let clip = project.clips.first_mut().unwrap();
+        clip.source_offset_seconds = 2.0;
+        clip.range = TimelineRange {
+            start_seconds: 3.0,
+            end_seconds: 7.0,
+        };
+
+        let mut kept = TextOverlay::default_caption();
+        kept.id = "kept".to_string();
+        kept.range = TimelineRange {
+            start_seconds: 4.0,
+            end_seconds: 6.0,
+        };
+        let mut discarded = TextOverlay::default_caption();
+        discarded.id = "discarded".to_string();
+        discarded.range = TimelineRange {
+            start_seconds: 7.5,
+            end_seconds: 8.5,
+        };
+        project.overlays = vec![Overlay::Text(kept), Overlay::Text(discarded)];
+
+        let playhead = project.trim_to_clip_selection(5.0).unwrap();
+
+        assert_eq!(playhead, 2.0);
+        assert_eq!(project.source.as_ref().unwrap().duration_seconds, Some(4.0));
+        let clip = project.clips.first().unwrap();
+        assert_eq!(clip.source_offset_seconds, 5.0);
+        assert_eq!(clip.range.start_seconds, 0.0);
+        assert_eq!(clip.range.end_seconds, 4.0);
+        assert_eq!(project.overlays.len(), 1);
+        let Overlay::Text(text) = &project.overlays[0];
+        assert_eq!(text.id, "kept");
+        assert_eq!(text.range.start_seconds, 1.0);
+        assert_eq!(text.range.end_seconds, 3.0);
+    }
 }

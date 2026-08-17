@@ -122,7 +122,7 @@ where
         if source_is_gif(project) {
             "source".to_string()
         } else {
-            format!("{fps}fps")
+            format!("{fps:.3}fps")
         },
         final_attempt.map(|attempt| attempt.colors).unwrap_or(project.settings.gif.colors),
         final_attempt
@@ -194,7 +194,7 @@ pub fn render_frame_png(
     let fps = export_fps(project)?;
     let mut frame_clip = clip.clone();
     frame_clip.range.start_seconds = playhead_seconds.max(0.0);
-    frame_clip.range.end_seconds = frame_clip.range.start_seconds + (1.0 / f64::from(fps));
+    frame_clip.range.end_seconds = frame_clip.range.start_seconds + (1.0 / fps);
     let geometry = RenderGeometry::from_project(project, &frame_clip, 1.0);
     let text_dir = drawtext_temp_dir()?;
     let video_filter = video_filter(project, &frame_clip, Some(fps), geometry, &text_dir)?;
@@ -204,7 +204,10 @@ pub fn render_frame_png(
             .arg("-hide_banner")
             .arg("-y")
             .arg("-ss")
-            .arg(format!("{:.6}", frame_clip.range.start_seconds))
+            .arg(format!(
+                "{:.6}",
+                source_seek_seconds(&frame_clip, frame_clip.range.start_seconds)
+            ))
             .arg("-i")
             .arg(&source.path)
             .arg("-frames:v")
@@ -223,7 +226,7 @@ pub fn render_frame_png(
 
 #[derive(Debug, Clone)]
 pub struct RenderedFrameSequence {
-    pub fps: u32,
+    pub fps: f64,
     pub duration_seconds: f64,
     pub frames: Vec<PathBuf>,
 }
@@ -253,7 +256,7 @@ pub fn render_frame_sequence(
         )
     })?;
 
-    let output_pattern = output_dir.join("frame-%06d.jpg");
+    let output_pattern = output_dir.join("frame-%06d.png");
     let result = run_ffmpeg_command(
         Command::new("ffmpeg")
             .arg("-hide_banner")
@@ -262,15 +265,16 @@ pub fn render_frame_sequence(
             .arg("-progress")
             .arg("pipe:2")
             .arg("-ss")
-            .arg(format!("{:.3}", clip.range.start_seconds))
+            .arg(format!(
+                "{:.6}",
+                source_seek_seconds(clip, clip.range.start_seconds)
+            ))
             .arg("-t")
             .arg(format!("{duration:.3}"))
             .arg("-i")
             .arg(&source.path)
             .arg("-filter_complex")
             .arg(video_filter)
-            .arg("-q:v")
-            .arg("5")
             .arg("-start_number")
             .arg("0")
             .arg(output_pattern),
@@ -291,7 +295,7 @@ pub fn render_frame_sequence(
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("frame-") && name.ends_with(".jpg"))
+                .is_some_and(|name| name.starts_with("frame-") && name.ends_with(".png"))
         })
         .collect::<Vec<_>>();
     frames.sort();
@@ -314,7 +318,7 @@ fn render_gif_once(
     project: &Project,
     output_path: &Path,
     clip: &Clip,
-    fps: u32,
+    fps: f64,
     geometry: RenderGeometry,
     progress: &dyn Fn(ExportProgress),
 ) -> Result<u16, String> {
@@ -365,7 +369,10 @@ fn render_gif_once(
         .arg("-progress")
         .arg("pipe:2")
         .arg("-ss")
-        .arg(format!("{:.3}", clip.range.start_seconds))
+        .arg(format!(
+            "{:.6}",
+            source_seek_seconds(clip, clip.range.start_seconds)
+        ))
         .arg("-t")
         .arg(format!("{duration:.3}"))
         .arg("-i")
@@ -384,7 +391,7 @@ fn render_frame_optimized_hdr_gif(
     project: &Project,
     output_path: &Path,
     clip: &Clip,
-    fps: u32,
+    fps: f64,
     duration: f64,
     video_filter: &str,
     progress: &dyn Fn(ExportProgress),
@@ -408,7 +415,10 @@ fn render_frame_optimized_hdr_gif(
             .arg("-progress")
             .arg("pipe:2")
             .arg("-ss")
-            .arg(format!("{:.3}", clip.range.start_seconds))
+            .arg(format!(
+                "{:.6}",
+                source_seek_seconds(clip, clip.range.start_seconds)
+            ))
             .arg("-t")
             .arg(format!("{duration:.3}"))
             .arg("-i")
@@ -506,7 +516,7 @@ fn hdr_palette_attempts(requested_colors: u16) -> Vec<u16> {
 fn assemble_frame_optimized_gif(
     image_magick: &str,
     frames: &[PathBuf],
-    fps: u32,
+    fps: f64,
     colors: u16,
     output_path: &Path,
 ) -> Result<(), String> {
@@ -554,10 +564,9 @@ fn image_magick_command() -> Option<&'static str> {
     })
 }
 
-fn gif_frame_delay_centiseconds(frame_index: usize, fps: u32) -> u32 {
-    let fps = u64::from(fps.max(1));
-    let frame_index = frame_index as u64;
-    let rounded_timestamp = |index: u64| (index * 100 + fps / 2) / fps;
+fn gif_frame_delay_centiseconds(frame_index: usize, fps: f64) -> u32 {
+    let fps = fps.max(1.0);
+    let rounded_timestamp = |index: usize| (index as f64 * 100.0 / fps).round() as i64;
     (rounded_timestamp(frame_index + 1) - rounded_timestamp(frame_index)).max(1) as u32
 }
 
@@ -709,7 +718,7 @@ fn frame_sequence_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn export_fps(project: &Project) -> Result<u32, String> {
+fn export_fps(project: &Project) -> Result<f64, String> {
     let source = project
         .source
         .as_ref()
@@ -719,7 +728,11 @@ fn export_fps(project: &Project) -> Result<u32, String> {
         "source media frame rate is unknown; refusing to render with a guessed fps".to_string()
     })?;
 
-    Ok(source_fps.round().clamp(1.0, 120.0) as u32)
+    Ok(source_fps.clamp(1.0, 120.0))
+}
+
+fn source_seek_seconds(clip: &Clip, timeline_seconds: f64) -> f64 {
+    (clip.source_offset_seconds + timeline_seconds).max(0.0)
 }
 
 fn source_is_gif(project: &Project) -> bool {
@@ -838,7 +851,7 @@ fn normalized_crop(crop: Option<CropRect>) -> CropRect {
 fn video_filter(
     project: &Project,
     clip: &Clip,
-    fps: Option<u32>,
+    fps: Option<f64>,
     geometry: RenderGeometry,
     text_dir: &Path,
 ) -> Result<String, String> {
@@ -853,7 +866,7 @@ fn video_filter(
     ));
     let mut filters = Vec::new();
     if let Some(fps) = fps {
-        filters.push(format!("fps={fps}"));
+        filters.push(format!("fps={fps:.6}"));
     }
     if source_needs_hdr_conversion(project) {
         if let Some(source) = &project.source {
@@ -1236,7 +1249,7 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 mod tests {
     use super::{
         export_fps, gif_frame_delay_centiseconds, gif_loop_count, hdr_palette_attempts,
-        palette_filter, render_attempts, source_needs_hdr_conversion,
+        palette_filter, render_attempts, source_needs_hdr_conversion, source_seek_seconds,
         uses_frame_optimized_hdr_encoder, video_filter, RenderAttempt, RenderGeometry,
     };
     use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
@@ -1313,6 +1326,25 @@ mod tests {
     }
 
     #[test]
+    fn export_fps_preserves_fractional_source_cadence() {
+        let mut project = geometry_test_project();
+        project.source.as_mut().unwrap().fps = Some(30_000.0 / 1001.0);
+
+        let fps = export_fps(&project).unwrap();
+
+        assert!((fps - 30_000.0 / 1001.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn source_seek_includes_committed_trim_offset() {
+        let mut project = geometry_test_project();
+        let clip = project.clips.first_mut().unwrap();
+        clip.source_offset_seconds = 12.5;
+
+        assert_eq!(source_seek_seconds(clip, 1.25), 13.75);
+    }
+
+    #[test]
     fn hdr_source_gets_automatic_sdr_conversion_before_palette() {
         let mut project = geometry_test_project();
         let source = project.source.as_mut().expect("test project has source");
@@ -1328,7 +1360,7 @@ mod tests {
         let filter = video_filter(
             &project,
             clip,
-            Some(24),
+            Some(24.0),
             geometry,
             std::path::Path::new("/tmp"),
         )
@@ -1368,7 +1400,7 @@ mod tests {
         let filter = video_filter(
             &project,
             clip,
-            Some(24),
+            Some(24.0),
             geometry,
             std::path::Path::new("/tmp"),
         )
@@ -1467,11 +1499,22 @@ mod tests {
     #[test]
     fn gif_frame_delays_preserve_24_fps_duration() {
         let delays = (0..24)
-            .map(|index| gif_frame_delay_centiseconds(index, 24))
+            .map(|index| gif_frame_delay_centiseconds(index, 24.0))
             .collect::<Vec<_>>();
 
         assert_eq!(delays.iter().sum::<u32>(), 100);
         assert!(delays.iter().all(|delay| matches!(delay, 4 | 5)));
+    }
+
+    #[test]
+    fn gif_frame_delays_approximate_30000_over_1001_cadence() {
+        let fps = 30_000.0 / 1001.0;
+        let delays = (0..300)
+            .map(|index| gif_frame_delay_centiseconds(index, fps))
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays.iter().sum::<u32>(), 1001);
+        assert!(delays.iter().all(|delay| matches!(delay, 3 | 4)));
     }
 
     #[test]
