@@ -316,6 +316,7 @@ struct InspectorWidgets {
     clip_mark_start: gtk::Button,
     clip_mark_end: gtk::Button,
     clip_trim_selection: gtk::Button,
+    clip_delete_frame: gtk::Button,
     clip_speed: adw::SpinRow,
     clip_fps: adw::SpinRow,
     target_size_enabled: adw::SwitchRow,
@@ -726,6 +727,7 @@ fn build_inspector(project: &Project) -> (gtk::Box, InspectorWidgets) {
             clip_mark_start: clip_widgets.mark_start,
             clip_mark_end: clip_widgets.mark_end,
             clip_trim_selection: clip_widgets.trim_selection,
+            clip_delete_frame: clip_widgets.delete_frame,
             clip_speed: clip_widgets.speed,
             clip_fps: clip_widgets.fps,
             target_size_enabled: gif_widgets.target_size_enabled,
@@ -765,6 +767,7 @@ struct ClipInspectorWidgets {
     mark_start: gtk::Button,
     mark_end: gtk::Button,
     trim_selection: gtk::Button,
+    delete_frame: gtk::Button,
     speed: adw::SpinRow,
     fps: adw::SpinRow,
 }
@@ -813,6 +816,15 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
         "Keep Selected Frames",
         &trim_selection,
     ));
+    let delete_frame = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Delete the frame at the playhead")
+        .valign(gtk::Align::Center)
+        .build();
+    group.add(&action_row_with_suffix(
+        "Delete Current Frame",
+        &delete_frame,
+    ));
     let speed = spin_row("Speed", clip.speed, 0.05, 8.0, 0.05);
     speed.set_sensitive(false);
     group.add(&speed);
@@ -839,6 +851,7 @@ fn build_clip_page(project: &Project) -> (gtk::ScrolledWindow, ClipInspectorWidg
             mark_start,
             mark_end,
             trim_selection,
+            delete_frame,
             speed,
             fps,
         },
@@ -1461,7 +1474,7 @@ fn max_media_frame_index(project: &Project) -> i64 {
         .or_else(|| project.clips.first().map(|clip| clip.range.end_seconds))
         .unwrap_or(3.0)
         .max(0.01);
-    (duration * fps).floor().max(1.0) as i64
+    (duration * fps).round().max(1.0) as i64
 }
 
 fn cropped_source_dimensions(project: &Project) -> Option<(f64, f64)> {
@@ -1792,6 +1805,12 @@ fn install_widget_bindings(
         let state = Rc::clone(state);
         let widgets = widgets.clone();
         move |_| trim_to_clip_selection(&state, &widgets)
+    });
+
+    widgets.inspector.clip_delete_frame.connect_clicked({
+        let state = Rc::clone(state);
+        let widgets = widgets.clone();
+        move |_| delete_current_frame(&state, &widgets)
     });
 
     widgets
@@ -2405,6 +2424,7 @@ fn apply_source_file(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, file: 
         }
         if let Some(clip) = state.project.clips.first_mut() {
             clip.source_offset_seconds = 0.0;
+            clip.retained_source_frames.clear();
         }
 
         if let Some(duration_seconds) = duration_seconds {
@@ -3662,6 +3682,88 @@ fn trim_to_clip_selection(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
     update_timeline_widgets(state, widgets);
 }
 
+fn delete_current_frame(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) {
+    {
+        let mut state = state.borrow_mut();
+        state.is_playing = false;
+        state.rendered_playback_start_requested = false;
+
+        let Some(cache) = state.rendered_playback_cache.as_ref() else {
+            crate::diagnostics::log_line(format_args!(
+                "delete current frame ignored: preview cache is not ready"
+            ));
+            return;
+        };
+        if cache.frames.len() <= 1 {
+            crate::diagnostics::log_line(format_args!(
+                "delete current frame ignored: clip must retain at least one frame"
+            ));
+            return;
+        }
+        let fps = cache.fps.max(1.0);
+        let frame_count = cache.frames.len();
+        let frame_index = playback_frame_index(state.playhead_seconds, 0.0, fps, frame_count);
+        let Some(deletion) = state.project.delete_timeline_frame(frame_index) else {
+            crate::diagnostics::log_line(format_args!(
+                "delete current frame ignored: model rejected frame {frame_index}"
+            ));
+            return;
+        };
+
+        state.playhead_seconds = deletion.new_playhead_seconds;
+        state.rendered_playback_frame_index = frame_index.min(deletion.new_frame_count - 1);
+        state.rendered_playback_origin_frame_index = state.rendered_playback_frame_index;
+        state.rendered_playback_tick = None;
+        state.rendered_playback_started_at = None;
+
+        if let Some(cache) = state.rendered_playback_cache.as_mut() {
+            cache.frames.remove(frame_index.min(cache.frames.len() - 1));
+            cache.clip_start_seconds = 0.0;
+            cache.clip_end_seconds = deletion.new_duration_seconds;
+        }
+
+        let frame_duration = 1.0 / fps;
+        state.thumbnails.retain_mut(|thumbnail| {
+            let thumbnail_frame = (thumbnail.timestamp_seconds * fps).round() as usize;
+            if thumbnail_frame == frame_index {
+                return false;
+            }
+            if thumbnail_frame > frame_index {
+                thumbnail.timestamp_seconds =
+                    (thumbnail.timestamp_seconds - frame_duration).max(0.0);
+            }
+            true
+        });
+
+        if state
+            .selected_overlay_id
+            .as_ref()
+            .is_some_and(|selected_id| {
+                !state.project.overlays.iter().any(|overlay| match overlay {
+                    Overlay::Text(text) => text.id == *selected_id,
+                })
+            })
+        {
+            state.selected_overlay_id =
+                state.project.overlays.first().map(|overlay| match overlay {
+                    Overlay::Text(text) => text.id.clone(),
+                });
+        }
+
+        crate::diagnostics::log_line(format_args!(
+            "deleted current frame without regeneration: timeline_frame={} source_frame={} frames={}->{} playhead={:.6}s",
+            deletion.timeline_frame,
+            deletion.source_frame,
+            frame_count,
+            deletion.new_frame_count,
+            deletion.new_playhead_seconds
+        ));
+    }
+
+    widgets.editor.source_title.set_label("Preview ready");
+    update_timeline_widgets(state, widgets);
+}
+
 fn update_target_size_enabled(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets, enabled: bool) {
     {
         let mut state = state.borrow_mut();
@@ -4578,6 +4680,13 @@ fn update_timeline_widgets(state: &Rc<RefCell<AppState>>, widgets: &AppWidgets) 
             .as_ref()
             .and_then(|source| source.fps)
             .unwrap_or(0.0),
+    );
+    widgets.inspector.clip_delete_frame.set_sensitive(
+        state
+            .borrow()
+            .rendered_playback_cache
+            .as_ref()
+            .is_some_and(|cache| cache.frames.len() > 1),
     );
     widgets.inspector.target_size_enabled.set_active(
         state
@@ -5593,6 +5702,14 @@ mod tests {
     }
 
     #[test]
+    fn media_end_boundary_rounds_to_the_nearest_frame() {
+        let mut project = output_test_project();
+        project.source.as_mut().unwrap().duration_seconds = Some(38.0 / 24.0);
+
+        assert_eq!(max_media_frame_index(&project), 38);
+    }
+
+    #[test]
     fn caption_drag_limits_are_stable_when_dragging_past_left_edge() {
         let start = CaptionDragStart {
             model_bounds: Rect {
@@ -5703,6 +5820,8 @@ mod tests {
         project
             .overlays
             .push(Overlay::Text(TextOverlay::default_caption()));
+        project.clips[0].retained_source_frames = vec![0, 1, 3, 4];
+        project.source.as_mut().unwrap().duration_seconds = Some(4.0 / 24.0);
         assert_eq!(rendered_playback_cache_key(&project), original_key);
 
         project.settings.gif.output_width = Some(800);

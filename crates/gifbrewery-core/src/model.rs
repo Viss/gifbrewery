@@ -41,11 +41,37 @@ impl Project {
 
     pub fn trim_to_clip_selection(&mut self, playhead_seconds: f64) -> Option<f64> {
         let selection = self.clips.first()?.range;
-        let duration = selection.duration_seconds().max(0.01);
         let selection_start = selection.start_seconds;
+        let fps = self.source.as_ref()?.fps.filter(|fps| *fps > 0.0)?;
+
+        let retained_frames = &self.clips.first()?.retained_source_frames;
+        let trimmed_frame_map = if retained_frames.is_empty() {
+            None
+        } else {
+            let start_frame = (selection.start_seconds * fps).round().max(0.0) as usize;
+            let end_frame = (selection.end_seconds * fps).round().max(0.0) as usize;
+            let start_frame = start_frame.min(retained_frames.len().saturating_sub(1));
+            let end_frame = end_frame.clamp(start_frame + 1, retained_frames.len());
+            let mut frames = retained_frames[start_frame..end_frame].to_vec();
+            let first_source_frame = *frames.first()?;
+            for frame in &mut frames {
+                *frame -= first_source_frame;
+            }
+            Some((frames, first_source_frame))
+        };
+        let duration = trimmed_frame_map
+            .as_ref()
+            .map(|(frames, _)| frames.len() as f64 / fps)
+            .unwrap_or_else(|| selection.duration_seconds())
+            .max(1.0 / fps);
 
         let clip = self.clips.first_mut()?;
-        clip.source_offset_seconds += selection_start;
+        if let Some((frames, first_source_frame)) = trimmed_frame_map {
+            clip.source_offset_seconds += first_source_frame as f64 / fps;
+            clip.retained_source_frames = frames;
+        } else {
+            clip.source_offset_seconds += selection_start;
+        }
         clip.range = TimelineRange {
             start_seconds: 0.0,
             end_seconds: duration,
@@ -71,6 +97,82 @@ impl Project {
 
         Some((playhead_seconds - selection_start).clamp(0.0, duration))
     }
+
+    pub fn delete_timeline_frame(&mut self, frame_index: usize) -> Option<FrameDeletion> {
+        let fps = self.source.as_ref()?.fps.filter(|fps| *fps > 0.0)?;
+        let source_duration = self.source.as_ref()?.duration_seconds?;
+        let frame_duration = 1.0 / fps;
+
+        let current_frame_count = {
+            let clip = self.clips.first()?;
+            if clip.retained_source_frames.is_empty() {
+                (source_duration * fps).round().max(1.0) as usize
+            } else {
+                clip.retained_source_frames.len()
+            }
+        };
+        if current_frame_count <= 1 {
+            return None;
+        }
+        let frame_index = frame_index.min(current_frame_count - 1);
+        let deleted_at = frame_index as f64 / fps;
+
+        let clip = self.clips.first_mut()?;
+        if clip.retained_source_frames.is_empty() {
+            clip.retained_source_frames = (0..current_frame_count as u64).collect();
+        }
+        let source_frame = clip.retained_source_frames.remove(frame_index);
+        let new_frame_count = clip.retained_source_frames.len();
+        let new_duration = new_frame_count as f64 / fps;
+
+        if deleted_at < clip.range.start_seconds {
+            clip.range.start_seconds = (clip.range.start_seconds - frame_duration).max(0.0);
+            clip.range.end_seconds = (clip.range.end_seconds - frame_duration).max(frame_duration);
+        } else if deleted_at < clip.range.end_seconds {
+            clip.range.end_seconds = (clip.range.end_seconds - frame_duration)
+                .max(clip.range.start_seconds + frame_duration);
+        }
+        clip.range.end_seconds = clip.range.end_seconds.min(new_duration);
+        clip.range.start_seconds = clip
+            .range
+            .start_seconds
+            .min((clip.range.end_seconds - frame_duration).max(0.0));
+
+        if let Some(source) = self.source.as_mut() {
+            source.duration_seconds = Some(new_duration);
+        }
+
+        self.overlays.retain_mut(|overlay| {
+            let range = match overlay {
+                Overlay::Text(text) => &mut text.range,
+            };
+            if range.end_seconds <= deleted_at {
+                return true;
+            }
+            if range.start_seconds > deleted_at {
+                range.start_seconds = (range.start_seconds - frame_duration).max(0.0);
+            }
+            range.end_seconds = (range.end_seconds - frame_duration).min(new_duration);
+            range.end_seconds > range.start_seconds
+        });
+
+        Some(FrameDeletion {
+            timeline_frame: frame_index,
+            source_frame,
+            new_frame_count,
+            new_duration_seconds: new_duration,
+            new_playhead_seconds: frame_index.min(new_frame_count - 1) as f64 / fps,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameDeletion {
+    pub timeline_frame: usize,
+    pub source_frame: u64,
+    pub new_frame_count: usize,
+    pub new_duration_seconds: f64,
+    pub new_playhead_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +198,8 @@ pub struct Clip {
     pub name: String,
     #[serde(default)]
     pub source_offset_seconds: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_source_frames: Vec<u64>,
     pub range: TimelineRange,
     pub frame_strategy: FrameStrategy,
     pub speed: f64,
@@ -108,6 +212,7 @@ impl Default for Clip {
         Self {
             name: "Current Clip".to_string(),
             source_offset_seconds: 0.0,
+            retained_source_frames: Vec::new(),
             range: TimelineRange {
                 start_seconds: 0.0,
                 end_seconds: 3.0,
@@ -381,5 +486,84 @@ mod tests {
         assert_eq!(text.id, "kept");
         assert_eq!(text.range.start_seconds, 1.0);
         assert_eq!(text.range.end_seconds, 3.0);
+    }
+
+    #[test]
+    fn deleting_frames_builds_one_retained_source_map_and_closes_timing_gaps() {
+        let mut project = Project::default();
+        project.source = Some(MediaSource {
+            path: "source.mp4".to_string(),
+            duration_seconds: Some(1.0),
+            natural_width: Some(640),
+            natural_height: Some(360),
+            fps: Some(10.0),
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            pixel_format: None,
+        });
+        project.clips[0].range = TimelineRange {
+            start_seconds: 0.0,
+            end_seconds: 1.0,
+        };
+        let mut overlay = TextOverlay::default_caption();
+        overlay.range = TimelineRange {
+            start_seconds: 0.5,
+            end_seconds: 0.9,
+        };
+        project.overlays = vec![Overlay::Text(overlay)];
+
+        let first = project.delete_timeline_frame(2).unwrap();
+        let second = project.delete_timeline_frame(2).unwrap();
+
+        assert_eq!(first.source_frame, 2);
+        assert_eq!(second.source_frame, 3);
+        assert_eq!(second.new_frame_count, 8);
+        assert_eq!(
+            project.clips[0].retained_source_frames,
+            vec![0, 1, 4, 5, 6, 7, 8, 9]
+        );
+        assert!(
+            (project.source.as_ref().unwrap().duration_seconds.unwrap() - 0.8).abs() < 0.000_001
+        );
+        assert!((project.clips[0].range.end_seconds - 0.8).abs() < 0.000_001);
+        let Overlay::Text(overlay) = &project.overlays[0];
+        assert!((overlay.range.start_seconds - 0.3).abs() < 0.000_001);
+        assert!((overlay.range.end_seconds - 0.7).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn trimming_slices_and_rebases_an_existing_retained_frame_map() {
+        let mut project = Project::default();
+        project.source = Some(MediaSource {
+            path: "source.mp4".to_string(),
+            duration_seconds: Some(1.0),
+            natural_width: Some(640),
+            natural_height: Some(360),
+            fps: Some(10.0),
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            pixel_format: None,
+        });
+        project.clips[0].range = TimelineRange {
+            start_seconds: 0.0,
+            end_seconds: 1.0,
+        };
+        project.delete_timeline_frame(2).unwrap();
+        project.clips[0].range = TimelineRange {
+            start_seconds: 0.1,
+            end_seconds: 0.5,
+        };
+
+        let playhead = project.trim_to_clip_selection(0.3).unwrap();
+
+        assert!((playhead - 0.2).abs() < 0.000_001);
+        assert!((project.clips[0].source_offset_seconds - 0.1).abs() < 0.000_001);
+        assert_eq!(project.clips[0].retained_source_frames, vec![0, 2, 3, 4]);
+        assert!((project.clips[0].range.end_seconds - 0.4).abs() < 0.000_001);
+        assert!(
+            (project.source.as_ref().unwrap().duration_seconds.unwrap() - 0.4).abs() < 0.000_001
+        );
     }
 }

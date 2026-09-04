@@ -206,7 +206,7 @@ pub fn render_frame_png(
             .arg("-ss")
             .arg(format!(
                 "{:.6}",
-                source_seek_seconds(&frame_clip, frame_clip.range.start_seconds)
+                render_source_seek_seconds(&frame_clip, frame_clip.range.start_seconds, fps)
             ))
             .arg("-i")
             .arg(&source.path)
@@ -244,8 +244,9 @@ pub fn render_frame_sequence(
         .source
         .as_ref()
         .ok_or_else(|| "project has no source media".to_string())?;
-    let duration = clip.range.duration_seconds().max(0.01);
     let fps = export_fps(project)?;
+    let duration = clip.range.duration_seconds().max(1.0 / fps);
+    let source_duration = render_source_duration_seconds(clip, fps);
     let geometry = RenderGeometry::from_project(project, clip, 1.0);
     let text_dir = drawtext_temp_dir()?;
     let video_filter = video_filter(project, clip, Some(fps), geometry, &text_dir)?;
@@ -267,14 +268,16 @@ pub fn render_frame_sequence(
             .arg("-ss")
             .arg(format!(
                 "{:.6}",
-                source_seek_seconds(clip, clip.range.start_seconds)
+                render_source_seek_seconds(clip, clip.range.start_seconds, fps)
             ))
             .arg("-t")
-            .arg(format!("{duration:.3}"))
+            .arg(format!("{source_duration:.6}"))
             .arg("-i")
             .arg(&source.path)
             .arg("-filter_complex")
             .arg(video_filter)
+            .arg("-fps_mode")
+            .arg("passthrough")
             .arg("-start_number")
             .arg("0")
             .arg(output_pattern),
@@ -323,6 +326,7 @@ fn render_gif_once(
     progress: &dyn Fn(ExportProgress),
 ) -> Result<u16, String> {
     let duration = clip.range.duration_seconds().max(0.01);
+    let source_duration = render_source_duration_seconds(clip, fps);
     let source = project
         .source
         .as_ref()
@@ -371,14 +375,17 @@ fn render_gif_once(
         .arg("-ss")
         .arg(format!(
             "{:.6}",
-            source_seek_seconds(clip, clip.range.start_seconds)
+            render_source_seek_seconds(clip, clip.range.start_seconds, fps)
         ))
         .arg("-t")
-        .arg(format!("{duration:.3}"))
+        .arg(format!("{source_duration:.6}"))
         .arg("-i")
         .arg(&source.path)
         .arg("-filter_complex")
         .arg(palette_filter);
+    if !clip.retained_source_frames.is_empty() {
+        command.arg("-fps_mode").arg("passthrough");
+    }
     command.arg("-loop").arg("0").arg(output_path);
 
     let result = run_ffmpeg_command(&mut command, duration, Some(progress));
@@ -402,6 +409,7 @@ fn render_frame_optimized_hdr_gif(
         .ok_or_else(|| "project has no source media".to_string())?;
     let frame_dir = frame_sequence_temp_dir("gifbrewery-hdr-export")?;
     let frame_pattern = frame_dir.join("frame-%06d.png");
+    let source_duration = render_source_duration_seconds(clip, fps);
 
     progress(ExportProgress {
         percent: Some(0),
@@ -417,14 +425,16 @@ fn render_frame_optimized_hdr_gif(
             .arg("-ss")
             .arg(format!(
                 "{:.6}",
-                source_seek_seconds(clip, clip.range.start_seconds)
+                render_source_seek_seconds(clip, clip.range.start_seconds, fps)
             ))
             .arg("-t")
-            .arg(format!("{duration:.3}"))
+            .arg(format!("{source_duration:.6}"))
             .arg("-i")
             .arg(&source.path)
             .arg("-filter_complex")
             .arg(video_filter)
+            .arg("-fps_mode")
+            .arg("passthrough")
             .arg("-start_number")
             .arg("0")
             .arg(&frame_pattern),
@@ -735,6 +745,69 @@ fn source_seek_seconds(clip: &Clip, timeline_seconds: f64) -> f64 {
     (clip.source_offset_seconds + timeline_seconds).max(0.0)
 }
 
+fn selected_retained_source_frames(clip: &Clip, fps: f64) -> Option<&[u64]> {
+    if clip.retained_source_frames.is_empty() {
+        return None;
+    }
+
+    let start_frame = (clip.range.start_seconds * fps).round().max(0.0) as usize;
+    let end_frame = (clip.range.end_seconds * fps).round().max(0.0) as usize;
+    let start_frame = start_frame.min(clip.retained_source_frames.len().saturating_sub(1));
+    let end_frame = end_frame.clamp(start_frame + 1, clip.retained_source_frames.len());
+    Some(&clip.retained_source_frames[start_frame..end_frame])
+}
+
+fn render_source_seek_seconds(clip: &Clip, timeline_seconds: f64, fps: f64) -> f64 {
+    let mapped_frame = (!clip.retained_source_frames.is_empty()).then(|| {
+        let frame_index = (timeline_seconds * fps).round().max(0.0) as usize;
+        clip.retained_source_frames[frame_index.min(clip.retained_source_frames.len() - 1)]
+    });
+    mapped_frame
+        .map(|frame| clip.source_offset_seconds + frame as f64 / fps)
+        .unwrap_or_else(|| source_seek_seconds(clip, timeline_seconds))
+        .max(0.0)
+}
+
+fn render_source_duration_seconds(clip: &Clip, fps: f64) -> f64 {
+    let Some(frames) = selected_retained_source_frames(clip, fps) else {
+        return clip.range.duration_seconds().max(1.0 / fps);
+    };
+    let first = frames[0];
+    let last = *frames.last().unwrap_or(&first);
+    (last.saturating_sub(first) + 1) as f64 / fps
+}
+
+fn retained_frame_select_filter(clip: &Clip, fps: f64) -> Option<String> {
+    let frames = selected_retained_source_frames(clip, fps)?;
+    let first = frames[0];
+    let mut runs = Vec::new();
+    let mut run_start = frames[0].saturating_sub(first);
+    let mut run_end = run_start;
+    for frame in frames.iter().skip(1) {
+        let frame = frame.saturating_sub(first);
+        if frame == run_end + 1 {
+            run_end = frame;
+            continue;
+        }
+        runs.push((run_start, run_end));
+        run_start = frame;
+        run_end = frame;
+    }
+    runs.push((run_start, run_end));
+    let expression = runs
+        .into_iter()
+        .map(|(start, end)| {
+            if start == end {
+                format!("eq(n\\,{start})")
+            } else {
+                format!("between(n\\,{start}\\,{end})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    Some(format!("select='{expression}',setpts=N/({fps:.6}*TB)"))
+}
+
 fn source_is_gif(project: &Project) -> bool {
     project
         .source
@@ -865,8 +938,16 @@ fn video_filter(
         geometry.text_scale()
     ));
     let mut filters = Vec::new();
-    if let Some(fps) = fps {
-        filters.push(format!("fps={fps:.6}"));
+    let filter_fps = fps.or_else(|| {
+        (!clip.retained_source_frames.is_empty())
+            .then(|| project.source.as_ref().and_then(|source| source.fps))
+            .flatten()
+    });
+    if let Some(filter_fps) = filter_fps {
+        filters.push(format!("fps={filter_fps:.6}"));
+        if let Some(select_filter) = retained_frame_select_filter(clip, filter_fps) {
+            filters.push(select_filter);
+        }
     }
     if source_needs_hdr_conversion(project) {
         if let Some(source) = &project.source {
@@ -1249,7 +1330,8 @@ fn gif_loop_count(bytes: &[u8]) -> Option<u16> {
 mod tests {
     use super::{
         export_fps, gif_frame_delay_centiseconds, gif_loop_count, hdr_palette_attempts,
-        palette_filter, render_attempts, source_needs_hdr_conversion, source_seek_seconds,
+        palette_filter, render_attempts, render_source_duration_seconds,
+        render_source_seek_seconds, source_needs_hdr_conversion, source_seek_seconds,
         uses_frame_optimized_hdr_encoder, video_filter, RenderAttempt, RenderGeometry,
     };
     use gifbrewery_core::{CropRect, MediaSource, Project, TimelineRange};
@@ -1525,6 +1607,35 @@ mod tests {
         );
         assert_eq!(hdr_palette_attempts(100), vec![100, 96, 64, 48, 32, 24, 16]);
         assert_eq!(hdr_palette_attempts(48), vec![48, 32, 24, 16]);
+    }
+
+    #[test]
+    fn retained_frame_map_controls_seek_span_and_filter_order() {
+        let mut project = geometry_test_project();
+        let clip = project.clips.first_mut().unwrap();
+        clip.retained_source_frames = vec![0, 1, 4, 5];
+        clip.range = TimelineRange {
+            start_seconds: 1.0 / 25.0,
+            end_seconds: 3.0 / 25.0,
+        };
+        let clip = project.clips.first().unwrap();
+        let geometry = RenderGeometry::from_project(&project, clip, 1.0);
+
+        assert!(
+            (render_source_seek_seconds(clip, clip.range.start_seconds, 25.0) - 0.04).abs()
+                < 0.000_001
+        );
+        assert!((render_source_duration_seconds(clip, 25.0) - 0.16).abs() < 0.000_001);
+        let filter = video_filter(
+            &project,
+            clip,
+            Some(25.0),
+            geometry,
+            std::path::Path::new("/tmp"),
+        )
+        .unwrap();
+        assert!(filter
+            .starts_with("fps=25.000000,select='eq(n\\,0)+eq(n\\,3)',setpts=N/(25.000000*TB)"));
     }
 
     fn geometry_test_project() -> Project {

@@ -89,6 +89,7 @@ fn maybe_run_smoke_export() -> Option<glib::ExitCode> {
         && command != "--smoke-compare-preview"
         && command != "--smoke-crop-playback"
         && command != "--smoke-overlay-after-crop"
+        && command != "--smoke-delete-frames"
     {
         return None;
     }
@@ -143,8 +144,43 @@ fn maybe_run_smoke_export() -> Option<glib::ExitCode> {
             };
             resized_range_smoke_project(source_path, width, start_seconds, end_seconds)
         }
+        "--smoke-delete-frames" => {
+            let Some(frame_indexes) = args.next() else {
+                eprintln!(
+                    "usage: gifbrewery-gtk --smoke-delete-frames SOURCE OUTPUT_DIR FRAME_INDEXES"
+                );
+                return Some(glib::ExitCode::FAILURE);
+            };
+            let mut project = full_duration_smoke_project(source_path);
+            project.settings.gif.output_width = Some(800);
+            project.settings.gif.output_height = None;
+            for frame_index in frame_indexes.split(',') {
+                let Some(frame_index) = frame_index.trim().parse::<usize>().ok() else {
+                    eprintln!("invalid frame index: {frame_index}");
+                    return Some(glib::ExitCode::FAILURE);
+                };
+                if project.delete_timeline_frame(frame_index).is_none() {
+                    eprintln!("could not delete timeline frame {frame_index}");
+                    return Some(glib::ExitCode::FAILURE);
+                }
+            }
+            project
+        }
         _ => smoke_project(source_path),
     };
+
+    if command == "--smoke-delete-frames" {
+        return match run_delete_frames_smoke(&project, Path::new(&output_path)) {
+            Ok(()) => {
+                eprintln!("delete-frames smoke artifacts written to {output_path}");
+                Some(glib::ExitCode::SUCCESS)
+            }
+            Err(err) => {
+                eprintln!("delete-frames smoke failed: {err}");
+                Some(glib::ExitCode::FAILURE)
+            }
+        };
+    }
 
     if command == "--smoke-crop-playback" {
         return match run_crop_playback_smoke(&project, Path::new(&output_path)) {
@@ -560,6 +596,76 @@ fn run_crop_playback_smoke(project: &Project, out_dir: &Path) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+fn run_delete_frames_smoke(project: &Project, out_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(out_dir).map_err(|err| {
+        format!(
+            "failed to create delete-frames smoke directory {}: {err}",
+            out_dir.display()
+        )
+    })?;
+    let frames_dir = out_dir.join("preview-frames");
+    let export_path = out_dir.join("deleted-frames.gif");
+    let report_path = out_dir.join("delete-frames-smoke.txt");
+    let _ = fs::remove_dir_all(&frames_dir);
+
+    let expected_frames = project
+        .clips
+        .first()
+        .map(|clip| clip.retained_source_frames.len())
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "delete-frames smoke project has no retained frame map".to_string())?;
+    let sequence = export::render_frame_sequence(project, &frames_dir)?;
+    export::export_gif(project, &export_path)?;
+    let export_frames = count_video_frames(&export_path)?;
+
+    fs::write(
+        &report_path,
+        format!(
+            "fps={:.6}\nexpected_frames={expected_frames}\npreview_frames={}\nexport_frames={export_frames}\npreview_dir={}\nexport={}\n",
+            sequence.fps,
+            sequence.frames.len(),
+            frames_dir.display(),
+            export_path.display()
+        ),
+    )
+    .map_err(|err| format!("failed to write {}: {err}", report_path.display()))?;
+
+    if sequence.frames.len() != expected_frames || export_frames != expected_frames {
+        return Err(format!(
+            "retained-frame mismatch: expected={expected_frames} preview={} export={export_frames}",
+            sequence.frames.len()
+        ));
+    }
+    Ok(())
+}
+
+fn count_video_frames(path: &Path) -> Result<usize, String> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-count_frames")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=nb_read_frames")
+        .arg("-of")
+        .arg("default=nokey=1:noprint_wrappers=1")
+        .arg(path)
+        .output()
+        .map_err(|err| format!("failed to count frames in {}: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe failed counting {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|err| format!("invalid frame count for {}: {err}", path.display()))
 }
 
 fn run_overlay_after_crop_smoke(project: &Project, out_dir: &Path) -> Result<(), String> {
